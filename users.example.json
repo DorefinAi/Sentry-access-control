@@ -1,0 +1,14 @@
+[
+  {
+    "username": "vansh",
+    "name": "Vansh",
+    "role": "admin",
+    "passwordHash": "scrypt$16384$8$1$<salt-hex>$<hash-hex>  (create real ones with: node scripts/add-user.mjs vansh \"Vansh\" admin)"
+  },
+  {
+    "username": "chief",
+    "name": "Chief editor",
+    "role": "viewer",
+    "passwordHash": "scrypt$16384$8$1$<salt-hex>$<hash-hex>"
+  }
+]

@@ -1,0 +1,21 @@
+node_modules
+.next
+next-env.d.ts
+*.tsbuildinfo
+.next-alt
+.next-*
+
+# local secrets (sign-in credentials)
+.env
+.env*.local
+users.local.json
+users.local.json.tmp
+users.local.json.*.tmp
+thresholds.local.json
+thresholds.local.json.tmp
+sessions.local.json
+sessions.local.json.tmp
+
+# any other local-only state
+*.local.json
+*.local.json.*

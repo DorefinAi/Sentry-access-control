@@ -1,0 +1,110 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  overflow-x: hidden;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The focus ring colour follows the theme ink; see MuiProvider */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+time:focus-visible,
+[role="button"]:focus-visible,
+[role="tab"]:focus-visible,
+[tabindex="0"]:focus-visible {
+  outline: 2px solid var(--focus-ring, #000);
+  outline-offset: 2px;
+}
+
+/* Dial needles sweep up from zero on first paint; later changes use a transition */
+@keyframes needle-in {
+  from {
+    transform: rotate(-135deg);
+  }
+}
+.gauge-needle {
+  animation: needle-in 1100ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* The event ticker: content is doubled, so sliding by half loops seamlessly */
+@keyframes ticker {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* Packets on the signal-flow wires (see components/status/PipelineStrip.tsx) */
+@keyframes pkt-x {
+  from {
+    left: 0%;
+    opacity: 0;
+  }
+  8% {
+    opacity: 1;
+  }
+  92% {
+    opacity: 1;
+  }
+  to {
+    left: calc(100% - 6px);
+    opacity: 0;
+  }
+}
+
+@keyframes pkt-y {
+  from {
+    top: 0%;
+    opacity: 0;
+  }
+  8% {
+    opacity: 1;
+  }
+  92% {
+    opacity: 1;
+  }
+  to {
+    top: calc(100% - 6px);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Packets hold still, spread along their wire */
+  .pkt {
+    animation: none !important;
+    opacity: 1 !important;
+  }
+  @media (min-width: 900px) {
+    .pkt {
+      left: var(--still) !important;
+    }
+  }
+  @media (max-width: 899.95px) {
+    .pkt {
+      top: var(--still) !important;
+    }
+  }
+
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
