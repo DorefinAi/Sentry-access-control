@@ -239,8 +239,9 @@ await test("failed-login usernames are hidden below admin", async () => {
   const { ist } = await load<typeof import("../data/time")>("../data/time.ts");
   const date = ist(Date.now()).slice(0, 10);
   const failedUsers = (reveal: boolean) => logins.loginReport(date, "sentry", { revealFailedUsers: reveal }).events.filter((e) => e.result !== "success").map((e) => e.user);
-  assert.deepEqual(failedUsers(false), [logins.HIDDEN_USER]);
-  assert.deepEqual(failedUsers(true), ["my-password-typed-here"]);
+  // Earlier tests' failed tries are there too: the sign-in log now survives a restart (audit.local.json)
+  assert.ok(failedUsers(false).length > 0 && failedUsers(false).every((u) => u === logins.HIDDEN_USER));
+  assert.ok(failedUsers(true).includes("my-password-typed-here"));
 });
 
 // ─── Owner role ─────────────────────────────────────────────────────────────

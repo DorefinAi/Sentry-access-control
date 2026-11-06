@@ -7,7 +7,7 @@ import { at, ist, ms, TODAY } from "@/data/time";
 import { authConfig, clearSessionCookie, readCookie, ROLE_RANK, SESSION_COOKIE, sessionCookie, signSession, verifySession, type RoleId, type Session } from "./auth";
 import { badRequest, HttpError } from "./http";
 import { addSession, checkToken, endSession, endSessionsOf, listSessions, touchSession, type Checked } from "./liveSessions";
-import { store, type Action, type ConsoleLogin } from "./store";
+import { markAuditDirty, store, type Action, type ConsoleLogin } from "./store";
 import { checkLogin, findUser, ROLE_LABEL } from "./users";
 import { isRecord, text } from "./validate";
 
@@ -125,6 +125,7 @@ function logAttempt(req: Request, entry: Omit<ConsoleLogin, "id" | "ip" | "userA
   const log = store().loginLog;
   log.push(record);
   trimLoginLog(log);
+  markAuditDirty();
   return record;
 }
 
@@ -171,7 +172,10 @@ export async function logout(req: Request): Promise<Response> {
   if (session?.sid) {
     await endSession(session.sid);
     const rec = recordFor(session);
-    if (rec) rec.endedAt = ist(Date.now());
+    if (rec) {
+      rec.endedAt = ist(Date.now());
+      markAuditDirty();
+    }
   }
   return Response.json({ ok: true }, { headers: { "Set-Cookie": clearSessionCookie(isHttps(req)), "Cache-Control": "no-store" } });
 }
@@ -184,7 +188,12 @@ export async function currentSession(req: Request): Promise<Current | null> {
   const current = await checkToken(readCookie(req.headers.get("cookie"), SESSION_COOKIE));
   if (!current) return null;
   const rec = recordFor(current.session);
-  if (rec) rec.lastSeen = ist(Date.now());
+  if (rec) {
+    const seen = ist(Date.now());
+    // Saved when the minute changes, not on every request (each save rewrites the whole audit file)
+    if (rec.lastSeen?.slice(0, 16) !== seen.slice(0, 16)) markAuditDirty();
+    rec.lastSeen = seen;
+  }
   return current;
 }
 
@@ -224,7 +233,10 @@ export async function reissueCookie(req: Request, current: Current, issuedAt = n
   const rec = recordFor(current.session);
   const { token } = await signSession(current.session.u, current.user.role, secret(), current.session.sid, issuedAt);
   if (current.session.sid) await touchSession(current.session.sid, issuedAt);
-  if (rec) rec.iat = issuedAt;
+  if (rec) {
+    rec.iat = issuedAt;
+    markAuditDirty();
+  }
   return sessionCookie(token, isHttps(req));
 }
 
@@ -252,6 +264,7 @@ export async function endOtherSessions(username: string, keepSid?: string): Prom
   for (const l of store().loginLog) {
     if (l.user === username && l.result === "success" && !l.endedAt && l.id !== keepSid) l.endedAt = stamp;
   }
+  markAuditDirty();
 }
 
 function lastLoginBefore(session: Session): { at: string; ip: string } | null {
@@ -276,7 +289,12 @@ const STATIC_ACTIONS: Action[] = [
 export async function buildProfile(session: Session, lastLogin = lastLoginBefore(session)): Promise<Profile> {
   const user = await findUser(session.u);
   const name = user?.name ?? session.u;
-  const actions = [...STATIC_ACTIONS, ...store().actionLog].filter((a) => a.user === session.u && a.at.startsWith(TODAY));
+  // Saved actions from earlier runs share the demo clock's "today", so only this run's count
+  // (realAt at or after this process started); the demo seeds have no realAt.
+  const bootedAt = store().bootedAt;
+  const actions = [...STATIC_ACTIONS, ...store().actionLog].filter(
+    (a) => a.user === session.u && a.at.startsWith(TODAY) && (!a.realAt || Date.parse(a.realAt) >= bootedAt),
+  );
   const count = (...kinds: Action["kind"][]) => actions.filter((a) => kinds.includes(a.kind)).length;
   return {
     username: session.u,
@@ -293,7 +311,7 @@ export async function buildProfile(session: Session, lastLogin = lastLoginBefore
     lastLogin,
     actionsToday: { acked: count("ack"), resolved: count("resolve", "incident_resolved"), incidentsOpened: count("incident_opened"), notes: count("note", "incident_note") },
     recent: [...actions]
-      .sort((a, b) => ms(b.at) - ms(a.at))
+      .sort((a, b) => (a.realAt && b.realAt ? Date.parse(b.realAt) - Date.parse(a.realAt) : ms(b.at) - ms(a.at)))
       .slice(0, 10)
       .map((a): { at: string; text: string; evidence?: Evidence[] } => ({ at: a.at, text: a.text, evidence: a.evidence })),
   };

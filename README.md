@@ -34,6 +34,10 @@ npm run dev          # http://localhost:3005
 | Reports `/reports` | Incidents (with a `.md` export), daily report, app logins, build log |
 | Ask (header) | Chat: "What broke today?", "Daily report", "Who logged in?", "What should I fix first?" |
 
+## Audit trail
+
+The action log (team, People, alerts, incidents, settings and account changes) and the sign-in log are saved to `audit.local.json` (gitignored). Each new action is saved within a second, and any other change within 10 s, so a restart keeps them. Actions also carry `realAt`, the real time; `at` stays on the demo clock until Phase 2. If the file cannot be read, the console starts with an empty log and does not save over the file.
+
 ## Phase 1: static data
 
 - Every route in `src/app/api/**` serves typed static data from `src/data/**`. The data is built in `src/server/**`.

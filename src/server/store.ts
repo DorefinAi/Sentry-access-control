@@ -5,6 +5,9 @@ import { seedAlerts } from "@/data/alerts";
 import { seedIncidents, type IncidentRecord } from "@/data/incidents";
 import { seedNotifications } from "@/data/notifications";
 import { at, ist, ms, NOW, YESTERDAY } from "@/data/time";
+import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { cleanEvidence } from "./evidence";
 
 export type ActionKind = "ack" | "resolve" | "reopen" | "note" | "incident_opened" | "incident_resolved" | "incident_note" | "team" | "people" | "settings" | "account";
@@ -15,6 +18,7 @@ export interface Action {
   kind: ActionKind;
   text: string;
   evidence?: Evidence[];
+  realAt?: string; // the real time (at follows the demo clock until Phase 2)
 }
 
 // Read state is per user: seeded items before noon count as read for everyone.
@@ -62,7 +66,12 @@ export function store(): Store {
     s.nextNotification = s.notificationLog.length + 1;
   }
   s.nextNotification ??= s.notificationLog.length + 1;
-  s.actionLog ??= [];
+  if (!s.actionLog || !s.loginLog) {
+    const saved = loadAudit();
+    s.actionLog ??= saved?.actionLog ?? [];
+    if (saved?.loginLog) s.loginLog ??= saved.loginLog;
+    startAuditSaver();
+  }
   // The sign-in before this server started, so "last login" has something to show.
   s.loginLog ??= [
     { id: "login-sentry-0001", user: "vansh", name: "Vansh", role: "Admin", at: at("18:40", YESTERDAY), ip: "10.0.0.12", userAgent: "Chrome 141 on Windows 10", result: "success", endedAt: at("23:05", YESTERDAY) },
@@ -78,7 +87,135 @@ export function liveNow(): string {
 }
 
 export function recordAction(action: Action): void {
-  store().actionLog.push(action);
+  const log = store().actionLog;
+  log.push({ ...action, realAt: new Date().toISOString() });
+  if (log.length > MAX_ACTIONS) log.splice(0, log.length - MAX_ACTIONS);
+  markAuditDirty();
+}
+
+// ─── Audit file ─────────────────────────────────────────────────────────────
+// The action log (who changed what: team, People, alerts, incidents, settings) and the sign-in log
+// are saved to audit.local.json (gitignored) so a restart keeps them. Every change calls
+// markAuditDirty(): saved a second later, checked again every 10 s, and written synchronously when
+// the process exits. Written atomically (temp file + rename), one write at a time. Failed sign-in
+// usernames (often a password typed into the wrong box) are hidden on disk; memory keeps them.
+
+const HIDDEN_USER = "(hidden)"; // same as logins.HIDDEN_USER (logins.ts imports this file)
+
+const MAX_ACTIONS = 20_000;
+export const AUDIT_FILE = () => path.join(process.cwd(), "audit.local.json");
+
+interface AuditFile {
+  version: 1;
+  actionLog: Action[];
+  loginLog: ConsoleLogin[];
+}
+
+function loadAudit(): AuditFile | null {
+  let raw: string;
+  try {
+    raw = readFileSync(AUDIT_FILE(), "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") console.error(`[audit] audit.local.json could not be read (${(e as NodeJS.ErrnoException).code}); starting empty and not saving over it.`);
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") auditState().broken = true;
+    return null;
+  }
+  try {
+    const v = JSON.parse(raw) as Partial<AuditFile>;
+    if (!Array.isArray(v.actionLog) || !Array.isArray(v.loginLog)) throw new Error("not an audit file");
+    return { version: 1, actionLog: v.actionLog, loginLog: v.loginLog };
+  } catch {
+    // Keep the bad file for a person to look at; never overwrite it with an empty log
+    console.error("[audit] audit.local.json is not valid; starting empty and not saving over it. Move the file away to start a new one.");
+    auditState().broken = true;
+    return null;
+  }
+}
+
+interface AuditState {
+  dirty: boolean;
+  writing: Promise<void>;
+  soon: ReturnType<typeof setTimeout> | null;
+  timer: ReturnType<typeof setInterval> | null;
+  broken: boolean;
+  exitHook: boolean;
+}
+
+function auditState(): AuditState {
+  const a = globalThis as typeof globalThis & { __sentryAudit?: AuditState };
+  return (a.__sentryAudit ??= { dirty: false, writing: Promise.resolve(), soon: null, timer: null, broken: false, exitHook: false });
+}
+
+/** The file's text, or null when there is nothing to save (or it must not be saved over). */
+function auditText(): string | null {
+  const s = g.__sentryStore;
+  if (auditState().broken || !s?.actionLog || !s.loginLog) return null;
+  const loginLog = s.loginLog.map((l) => (l.result === "success" ? l : { ...l, user: HIDDEN_USER }));
+  const body: AuditFile = { version: 1, actionLog: s.actionLog, loginLog };
+  return JSON.stringify(body);
+}
+
+/** Writes the audit file if anything changed since the last write. */
+export function saveAudit(): Promise<void> {
+  const st = auditState();
+  st.writing = st.writing.then(async () => {
+    if (!st.dirty) return;
+    st.dirty = false; // a change during the write marks it again
+    const text = auditText();
+    if (text === null) return;
+    const file = AUDIT_FILE();
+    try {
+      await writeFile(`${file}.tmp`, text, { mode: 0o600 });
+      await rename(`${file}.tmp`, file);
+    } catch (e) {
+      st.dirty = true;
+      console.error(`[audit] saving audit.local.json failed: ${(e as Error).message}`);
+    }
+  });
+  return st.writing;
+}
+
+// Last chance on process.exit (Next calls it on Ctrl+C / SIGTERM): a synchronous write.
+function saveAuditNow(): void {
+  const st = auditState();
+  if (!st.dirty) return;
+  const text = auditText();
+  if (text === null) return;
+  const file = AUDIT_FILE();
+  try {
+    writeFileSync(`${file}.tmp`, text, { mode: 0o600 });
+    renameSync(`${file}.tmp`, file);
+    st.dirty = false;
+  } catch (e) {
+    console.error(`[audit] saving audit.local.json on exit failed: ${(e as Error).message}`);
+  }
+}
+
+/** Call after any change to the action log or the sign-in log (including edits in place). */
+export function markAuditDirty(): void {
+  auditState().dirty = true;
+  saveAuditSoon();
+}
+
+function saveAuditSoon(): void {
+  const st = auditState();
+  if (st.soon) return;
+  st.soon = setTimeout(() => {
+    st.soon = null;
+    void saveAudit();
+  }, 1000);
+  st.soon.unref?.();
+}
+
+function startAuditSaver(): void {
+  const st = auditState();
+  if (!st.exitHook) {
+    st.exitHook = true;
+    process.on("exit", saveAuditNow);
+  }
+  if (st.timer) return;
+  st.timer = setInterval(() => void saveAudit(), 10_000);
+  st.timer.unref?.();
 }
 
 export function addNotification(n: Omit<Notification, "id" | "read">): void {

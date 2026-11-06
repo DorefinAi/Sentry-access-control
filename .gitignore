@@ -19,3 +19,4 @@ sessions.local.json.tmp
 # any other local-only state
 *.local.json
 *.local.json.*
+audit.local.json
