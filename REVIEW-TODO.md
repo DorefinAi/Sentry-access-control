@@ -19,7 +19,7 @@ Items 1-5 and the first two small items under 12 were fixed on 2026-10-30. Tests
 ## Bugs
 6. **Replay breaks over time.** It goes wrong after 16:30 board time and stops entirely after the server has run past midnight IST. Fix: take the upper limit from the frozen `NOW` (`JogWheel.tsx`, `moment.ts`).
 7. **The uptime knob moves the wrong way** and can't reach 99–100. Fix: give each gauge its own step, 0.1 for uptime (`Knob.tsx`).
-8. **Viewers get a 403 when they mark notifications read** (`api/notifications/route.ts`). Fix: allow any signed-in user.
+8. ~~**Viewers get a 403 when they mark notifications read**~~ Fixed 2026-11-06: PATCH uses `requireCurrent` (read state is per person).
 9. **Writes to `thresholds.local.json` aren't serialised.** In-memory values change before the disk write succeeds.
 10. **Paths ending in `.js`, `.css`, `.png` and similar skip the proxy** (`src/proxy.ts` matcher). Fixed for `/api/*` (2026-10-30); page paths with those endings still skip it.
 11. **While you turn the jog wheel, the board flashes back to live data.** Fix: keep the last replay result until the next one arrives.

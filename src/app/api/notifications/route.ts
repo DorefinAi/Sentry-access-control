@@ -1,7 +1,7 @@
 import { preferencesOf } from "@/server/account";
 import { handle, readJson } from "@/server/http";
 import { listNotifications, markNotifications, parseNotificationPatch } from "@/server/notifications";
-import { requireCurrent, requireRole } from "@/server/session";
+import { requireCurrent } from "@/server/session";
 
 export const dynamic = "force-dynamic";
 
@@ -16,8 +16,8 @@ export function GET(req: Request) {
 
 export function PATCH(req: Request) {
   return handle(req, async () => {
-    const session = await requireRole(req, "operator");
-    const { user } = (await requireCurrent(req));
+    // Read state is per person, so every signed-in role (viewers too) may mark its own notifications read
+    const { session, user } = await requireCurrent(req);
     return Response.json(markNotifications(parseNotificationPatch(await readJson(req)), session.u, preferencesOf(user.prefs).notify.kinds));
   });
 }
