@@ -19,4 +19,6 @@ sessions.local.json.tmp
 # any other local-only state
 *.local.json
 *.local.json.*
+sentry.local.db
+sentry.local.db-*
 audit.local.json

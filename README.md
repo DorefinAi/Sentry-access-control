@@ -34,6 +34,17 @@ npm run dev          # http://localhost:3005
 | Reports `/reports` | Incidents (with a `.md` export), daily report, app logins, build log |
 | Ask (header) | Chat: "What broke today?", "Daily report", "Who logged in?", "What should I fix first?" |
 
+## Logs (live)
+
+- Once `SAMVADIA_API_URL` / `SAMVADIA_OWNER_KEY` or `SOCIA_API_URL` / `SOCIA_OWNER_KEY` is set, the Logs page, the system pages and the log summaries show the **real** backend logs. With neither set they show the demo data, and the page says so.
+- Sentry pulls `GET /owner/logs` from each backend every 15 s (`src/server/logSync.ts`, started by `src/instrumentation.ts`). It uses the same key as the People page, with actor `sentry-sync`. The contract is in `c:\vartmaan\code\dev-docs\ops-logs-contract.md`.
+- Lines are stored in `sentry.local.db`, a gitignored SQLite file that uses Node's built-in `node:sqlite` (Node 22.13+). Lines are kept for 30 days. Deleting the file starts again from each backend's newest lines.
+- Every line is redacted twice: by the backend before it stores the line, and again by Sentry (`src/server/redact.ts`). That covers passwords, tokens, keys, cookies, credentials in URLs, emails (`a***@domain`) and phone numbers (last 4 digits kept). Every signed-in role can read logs.
+- The strip above the list shows when each backend was last pulled and each process's last heartbeat. A process that has been silent for 90 s or more turns amber.
+- Time presets ("Last hour" and the like) count from real time for live logs and from the frozen demo clock for demo data.
+- If a backend's URL changes, or its database is reset (its ids restart below Sentry's cursor), Sentry drops that backend's stored lines and starts again from its newest ones.
+- Tests (each run with `node --no-warnings --import ./scripts/test-resolve.mjs <file>`): `src/server/logs.test.ts`, `redact.test.ts`, `logSource.test.ts`, `logSummary.test.ts`, `audit.test.ts`.
+
 ## Audit trail
 
 The action log (team, People, alerts, incidents, settings and account changes) and the sign-in log are saved to `audit.local.json` (gitignored). Each new action is saved within a second, and any other change within 10 s, so a restart keeps them. Actions also carry `realAt`, the real time; `at` stays on the demo clock until Phase 2. If the file cannot be read, the console starts with an empty log and does not save over the file.

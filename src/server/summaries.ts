@@ -2,7 +2,7 @@ import type { AiSummary, SummaryScope } from "@/types/control";
 import { TODAY } from "@/data/time";
 import { dayNarrative, incidentDraft, logsSummary } from "./ai/summary";
 import { badRequest, notFound } from "./http";
-import { filterLogs, parseLogQuery } from "./logs";
+import { logStats, parseLogQuery } from "./logs";
 import { REPORT_DATES } from "./reports";
 import { liveMoment } from "./moment";
 import { liveNow, store } from "./store";
@@ -43,5 +43,5 @@ export function getSummary(params: URLSearchParams): AiSummary {
     q.slug ? `slug ${q.slug}` : null,
     date ? `on ${date}` : null,
   ].filter(Boolean);
-  return logsSummary(filterLogs(q), label.length ? label.join(", ") : "all filters", now);
+  return logsSummary(logStats(q), label.length ? label.join(", ") : "all filters", now);
 }

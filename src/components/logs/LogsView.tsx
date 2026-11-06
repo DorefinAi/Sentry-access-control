@@ -9,8 +9,8 @@ import { useApi } from "@/hooks/useApi";
 import { useDebounced } from "@/hooks/useDebounced";
 import { useClockReady } from "@/hooks/useNow";
 import { LEVELS, LEVEL_LABELS, SYSTEM_IDS, SYSTEM_NAMES } from "@/lib/labels";
-import { RANGE_LABELS, RangePreset, rangeToWindow } from "@/lib/time";
-import type { AiSummary, LogEntry, LogLevel, LogQuery, SystemId } from "@/types/control";
+import { RANGE_LABELS, RangePreset, exactIst, relative } from "@/lib/time";
+import type { AiSummary, LogEntry, LogLevel, LogPage, LogQuery, SystemId } from "@/types/control";
 import { PageHeader, cardSx } from "@/components/common/Bits";
 import { AsyncView, ErrorNote, LoadingRows } from "@/components/common/AsyncView";
 import { AiSummaryBox } from "@/components/common/AiSummaryBox";
@@ -55,7 +55,8 @@ function toSearch(f: Filters): string {
 }
 
 function toQuery(f: Filters): LogQuery {
-  return { system: f.systems, level: f.level ? [f.level] : undefined, q: f.q || undefined, slug: f.slug || undefined, ...rangeToWindow(f.range), limit: PAGE };
+  // The server turns the range into times with its own clock (real for live logs, frozen for the demo)
+  return { system: f.systems, level: f.level ? [f.level] : undefined, q: f.q || undefined, slug: f.slug || undefined, range: f.range, limit: PAGE };
 }
 
 const LEVEL_OPTIONS: { value: LogLevel | ""; label: string }[] = [
@@ -93,6 +94,57 @@ function DebouncedField({ value, onCommit, label, placeholder, mono, icon }: { v
       }}
       sx={{ minWidth: 0 }}
     />
+  );
+}
+
+const STALE_BEAT_MS = 90_000; // three missed 30 s heartbeats
+
+/** Where the lines come from: each backend's last pull and its processes' heartbeats, or "demo data". */
+function SourceStrip({ page }: { page: LogPage }) {
+  // Heartbeats and pulls are real time, not the demo clock, so this ticks on its own
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(t);
+  }, []);
+  if (!page.live) {
+    return (
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+        Demo data. Set <code>SAMVADIA_API_URL</code> / <code>SAMVADIA_OWNER_KEY</code> or <code>SOCIA_API_URL</code> / <code>SOCIA_OWNER_KEY</code> in <code>.env.local</code> to see the real logs.
+      </Typography>
+    );
+  }
+  return (
+    <Box component="ul" aria-label="Log sources" sx={{ ...cardSx, listStyle: "none", m: 0, mb: 1.5, px: 1.5, py: 1, display: "flex", flexWrap: "wrap", gap: 2 }}>
+      {page.sources.map((s) => (
+        <Box component="li" key={s.source} sx={{ minWidth: 0 }}>
+          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+            {s.label}{" "}
+            <Box component="span" sx={{ fontWeight: 400, color: s.lastError ? "error.main" : "text.secondary" }}>
+              {s.lastError ? `not pulling: ${s.lastError}` : s.lastOkAt ? `pulled ${relative(s.lastOkAt, now)}` : "waiting for the first pull"}
+            </Box>
+          </Typography>
+          {s.processes.length ? (
+            <Typography variant="caption" color="text.secondary" component="p" sx={{ m: 0 }}>
+              {s.processes.map((p, i) => {
+                const stale = now - Date.parse(p.beatAt) > STALE_BEAT_MS;
+                return (
+                  <Box component="span" key={p.process} title={`${p.host}, running since ${exactIst(p.startedAt)}`} sx={{ color: stale ? "warning.main" : undefined }}>
+                    {i ? " · " : ""}
+                    {p.process} {stale ? "silent since" : "beat"} {relative(p.beatAt, now)}
+                  </Box>
+                );
+              })}
+            </Typography>
+          ) : null}
+          {s.dropped ? (
+            <Typography variant="caption" color="warning.main" component="p" sx={{ m: 0 }}>
+              {s.dropped} lines dropped by the backend before saving
+            </Typography>
+          ) : null}
+        </Box>
+      ))}
+    </Box>
   );
 }
 
@@ -226,6 +278,8 @@ export default function LogsView() {
           <ErrorNote error={shownSummary.error} what="a summary" onRetry={summarize} />
         </Box>
       ) : null}
+
+      {first.data ? <SourceStrip page={first.data} /> : null}
 
       <Box sx={{ ...cardSx, overflow: "hidden" }}>
         <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.5, py: 1, flexWrap: "wrap" }}>

@@ -362,9 +362,27 @@ export interface LogQuery {
   slug?: string;
   cursor?: string;
   limit?: number; // default 100, max 500
+  // A preset counted from the server's clock (real time for live logs, the frozen demo time otherwise).
+  // Used when from/to are not given.
+  range?: LogRange;
+}
+
+export type LogRange = "15m" | "1h" | "6h" | "24h" | "today" | "all";
+
+/** One backend Sentry pulls logs from (dev-docs/ops-logs-contract.md). */
+export interface LogSourceStatus {
+  source: "samvadia" | "socia";
+  label: string;
+  lastOkAt: string | null; // last successful pull
+  lastError: string | null; // set while the last pull failed
+  dropped: number; // lines the backend dropped before storing them
+  processes: { process: string; system: string; host: string; startedAt: string; beatAt: string }[];
 }
 
 export interface LogPage {
+  // true: real lines pulled from the backends; false: the Phase 1 demo data (no backend configured)
+  live: boolean;
+  sources: LogSourceStatus[];
   entries: LogEntry[]; // newest first
   nextCursor: string | null;
   total: number; // matching entries in the window

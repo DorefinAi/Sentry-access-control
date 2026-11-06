@@ -1,12 +1,13 @@
 // Written text for Phase 1. Each template prints only numbers from the facts it builds, and every
 // summary is checked by verifyNumbers against those same curated facts (never raw records).
-import type { AiSummary, Alert, Evidence, Incident, LogEntry } from "@/types/control";
+import type { AiSummary, Alert, Evidence, Incident } from "@/types/control";
 import { YESTERDAY_FLOW } from "@/data/daily";
 import { SYSTEM_BY_ID } from "@/data/systems";
 import { hhmm, ms, TODAY } from "@/data/time";
 import { BACKUP, OCTOPUS_GAP } from "@/data/world";
 import type { IncidentRecord } from "@/data/incidents";
 import { cleanEvidence } from "../evidence";
+import type { LogStats } from "../logs";
 import type { Moment } from "../moment";
 import { verifyNumbers, type Facts } from "./verifyNumbers";
 
@@ -113,40 +114,29 @@ export function withDraft(i: IncidentRecord, generatedAt: string): Incident {
   };
 }
 
-export function logsSummary(entries: LogEntry[], scopeLabel: string, generatedAt: string): AiSummary {
-  const byLevel = { error: 0, warn: 0, info: 0, debug: 0 };
-  const bySystem = new Map<string, number>();
-  const errorMessages = new Map<string, { count: number; first: LogEntry }>();
-  for (const e of entries) {
-    byLevel[e.level]++;
-    bySystem.set(e.system, (bySystem.get(e.system) ?? 0) + 1);
-    if (e.level === "error") {
-      const m = errorMessages.get(e.message);
-      if (m) m.count++;
-      else errorMessages.set(e.message, { count: 1, first: e });
-    }
-  }
-  const topSystems = [...bySystem.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
-  const topError = [...errorMessages.entries()].sort((a, b) => b[1].count - a[1].count)[0];
+// Takes counts over every matching line (logStats in logs.ts), so a large window is summarised exactly.
+export function logsSummary(stats: LogStats, scopeLabel: string, generatedAt: string): AiSummary {
+  const { total, byLevel, topError } = stats;
+  const topSystems = stats.bySystem.slice(0, 3);
   const name = (id: string) => SYSTEM_BY_ID.get(id as never)?.name ?? id;
 
   // Only the counts are facts; the scope label, system names and the quoted error are repeated verbatim.
   const facts: Facts = {
-    values: { total: entries.length, byLevel, topSystems: topSystems.map(([, n]) => n), topErrorCount: topError?.[1].count ?? 0 },
-    quotable: [scopeLabel, topError?.[0], ...topSystems.map(([id]) => name(id))],
+    values: { total, byLevel, topSystems: topSystems.map(([, n]) => n), topErrorCount: topError?.count ?? 0 },
+    quotable: [scopeLabel, topError?.message, ...topSystems.map(([id]) => name(id))],
   };
 
-  if (!entries.length) {
+  if (!total) {
     return makeSummary(`No log lines match ${scopeLabel}.`, [], facts, generatedAt);
   }
   const parts = [
-    `${plural(entries.length, "log line matches", "log lines match")} ${scopeLabel}: ${byLevel.error} errors, ${byLevel.warn} warnings.`,
+    `${plural(total, "log line matches", "log lines match")} ${scopeLabel}: ${byLevel.error} errors, ${byLevel.warn} warnings.`,
     `Most come from ${topSystems.map(([id, n]) => `${name(id)} (${n})`).join(", ")}.`,
   ];
   const evidence: Evidence[] = [];
   if (topError) {
-    parts.push(`The most common error is "${topError[0]}" (${plural(topError[1].count, "time", "times")}).`);
-    evidence.push({ kind: "log", id: topError[1].first.id, label: "First of these errors" });
+    parts.push(`The most common error is "${topError.message}" (${plural(topError.count, "time", "times")}).`);
+    evidence.push({ kind: "log", id: topError.firstId, label: "First of these errors" });
   } else {
     parts.push("There are no errors in this set.");
   }

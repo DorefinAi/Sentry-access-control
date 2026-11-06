@@ -28,6 +28,11 @@ export class NotConnected extends HttpError {
   }
 }
 
+/** Both env values are filled in (whether they are usable is ownerConfig's question). */
+export function ownerEnvSet(system: PeopleSystem): boolean {
+  return !!process.env[ENV[system].url]?.trim() && !!process.env[ENV[system].key]?.trim();
+}
+
 interface Config {
   base: string;
   key: string;

@@ -1,8 +1,8 @@
 import type { Alert, Health, System, SystemDetail } from "@/types/control";
-import { LOGS } from "@/data/logs";
 import { NOW } from "@/data/time";
 import { SYSTEM_BY_ID, SYSTEMS } from "@/data/systems";
 import { notFound } from "./http";
+import { recentLogs } from "./logs";
 import { outageNow } from "./mission";
 import { store } from "./store";
 import { isSystemId } from "./validate";
@@ -33,7 +33,7 @@ export function getSystemDetail(id: string): SystemDetail {
   if (!isSystemId(id)) throw notFound(`There is no system called "${id}".`);
   const alerts = store().alerts;
   const system = withAlerts(SYSTEM_BY_ID.get(id)!, alerts, NOW);
-  const recentLogs = LOGS.filter((l) => l.system === id).slice(-50).reverse();
+  const logs = recentLogs(id, 50);
   const openAlerts = alerts.filter((a) => a.state !== "resolved" && a.systems.includes(id));
-  return { ...system, recentLogs, openAlerts };
+  return { ...system, recentLogs: logs, openAlerts };
 }

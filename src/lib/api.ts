@@ -141,6 +141,7 @@ export function logQueryParams(q: LogQuery): Params {
     q: q.q,
     from: q.from,
     to: q.to,
+    range: q.range,
     slug: q.slug,
     cursor: q.cursor,
     limit: q.limit,
