@@ -6,13 +6,15 @@
 // change goes through that system's owner API, which keeps its own safety rules.
 import { useRouter, useSearchParams } from "next/navigation";
 import { Box, Button, ButtonBase, Dialog, DialogActions, DialogContent, DialogContentText, DialogTitle, Drawer, FormControl, IconButton, InputAdornment, InputLabel, ListSubheader, MenuItem, Select, Tab, Tabs, TextField, Tooltip, Typography } from "@mui/material";
-import { PlugZap, Search, X } from "lucide-react";
+import { PlugZap, Search, Trash2, X } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
-import { getPeople } from "@/lib/api";
+import { ApiRequestError, deletePerson, getPeople } from "@/lib/api";
 import { useApi } from "@/hooks/useApi";
+import { invalidate } from "@/lib/invalidate";
+import { Result } from "@/components/settings/parts";
 import { filterRows, NO_FILTER, type RowFilter, type StatusFilter, type SystemFilter } from "@/lib/people";
 import type { NearMatch, OwnerUser, PeopleOverview, PeopleSystem, PersonRow } from "@/types/people";
-import { PEOPLE_SYSTEMS, SYSTEM_LABEL } from "@/types/people";
+import { DELETABLE_SYSTEMS, PEOPLE_SYSTEMS, SYSTEM_LABEL } from "@/types/people";
 import { useSession } from "@/providers/SessionProvider";
 import { DISPLAY_STACK } from "@/providers/MuiProvider";
 import { PageHeader, Raw } from "@/components/common/Bits";
@@ -201,6 +203,83 @@ function NearMatches({ data, onOpen }: { data: PeopleOverview; onOpen: (key: str
   );
 }
 
+/**
+ * Delete one person's account in a system that allows it (Socia). A soft delete there: they cannot
+ * sign in, drop out of every list, and their past posts keep their name. Asks first.
+ */
+function DeleteAccount({ system, user, onDeleted }: { system: PeopleSystem; user: OwnerUser; onDeleted: (system: PeopleSystem, id: string) => void }) {
+  const label = SYSTEM_LABEL[system];
+  const [asking, setAsking] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const titleId = `delete-${system}-title`;
+
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await deletePerson(system, user.id);
+      invalidate("people:history");
+      setAsking(false);
+      onDeleted(system, user.id);
+    } catch (e) {
+      const err = e as ApiRequestError;
+      if (err.code === "not_found") {
+        // Someone else deleted them first: same end result
+        invalidate("people:history");
+        setAsking(false);
+        onDeleted(system, user.id);
+        return;
+      }
+      if (err.code === "last_admin") setError(`Not deleted: ${user.name} is the last active admin in ${label}. Make someone else an admin first, then try again.`);
+      else if (err.code === "self") setError(`Not deleted: ${label} will not delete the account the change is made as. Ask another owner to do it.`);
+      else setError(err.message);
+      if (err.code === "outcome_unknown") {
+        invalidate("people");
+        invalidate("people:history");
+      }
+      setAsking(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Box component="section" aria-labelledby={`delete-${system}-heading`} sx={{ display: "grid", gap: 1, mt: 3, mb: 2, p: 1.5, border: 1, borderColor: "error.main", borderRadius: "4px" }}>
+      <Box sx={{ display: "flex", gap: 1.5, alignItems: "center", flexWrap: "wrap" }}>
+        <Box sx={{ flex: 1, minWidth: 200 }}>
+          <Typography component="h3" id={`delete-${system}-heading`} variant="body2" sx={{ fontWeight: 700 }}>
+            Delete from {label}
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            They can&apos;t sign in and disappear from the lists. Their past posts keep their name.
+          </Typography>
+        </Box>
+        <Button variant="outlined" color="error" startIcon={<Trash2 size={14} aria-hidden />} onClick={() => setAsking(true)} disabled={busy}>
+          Delete {user.name}
+        </Button>
+      </Box>
+      <Result msg={error ? { ok: false, text: error } : null} />
+      <Dialog open={asking} onClose={() => (busy ? undefined : setAsking(false))} aria-labelledby={titleId}>
+        <DialogTitle id={titleId} sx={{ fontWeight: 700 }}>
+          Delete {user.name}?
+        </DialogTitle>
+        <DialogContent>
+          <DialogContentText>They can&apos;t sign in and disappear from the lists. Their past posts keep their name.</DialogContentText>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2 }}>
+          <Button onClick={() => setAsking(false)} disabled={busy} autoFocus>
+            Cancel
+          </Button>
+          <Button variant="contained" color="error" onClick={() => void run()} disabled={busy}>
+            {busy ? "Deleting…" : `Delete ${user.name}`}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+}
+
 type DrawerTab = PeopleSystem | "history";
 
 /** Page and action keys to their catalogue labels, for the history lines. */
@@ -219,12 +298,14 @@ function PersonPanel({
   onUser,
   onClose,
   onDirty,
+  onDeleted,
   hints,
   gone,
 }: {
   row: PersonRow;
   data: PeopleOverview;
   onUser: (system: PeopleSystem, u: OwnerUser) => void;
+  onDeleted: (system: PeopleSystem, id: string) => void;
   onClose: () => void;
   onDirty: (system: PeopleSystem, dirty: boolean) => void;
   hints: number;
@@ -272,6 +353,7 @@ function PersonPanel({
       {PEOPLE_SYSTEMS.map((s) => (
         <Box key={s} id={`panel-${s}`} role="tabpanel" aria-labelledby={`tab-${s}`} hidden={tab !== s} sx={{ px: { xs: 2, sm: 3 }, pt: 2, flex: 1 }}>
           <SystemEditor system={s} user={row[s]} status={data.systems[s]} onUser={(u) => onUser(s, u)} onDirty={onDirty} />
+          {row[s] && data.systems[s].connected && DELETABLE_SYSTEMS.includes(s) ? <DeleteAccount system={s} user={row[s]!} onDeleted={onDeleted} /> : null}
         </Box>
       ))}
       <Box id="panel-history" role="tabpanel" aria-labelledby="tab-history" hidden={tab !== "history"} sx={{ px: { xs: 2, sm: 3 }, pt: 2, pb: 2, flex: 1 }}>
@@ -319,6 +401,20 @@ export default function PeopleView() {
       const cur = prev ?? base;
       return { ...cur, rows: cur.rows.map((r) => (r.key === key ? { ...r, [system]: u } : r)) };
     });
+  };
+
+  // A deleted account leaves the list at once: drop it from its row (and the row if nothing is left),
+  // then reload so the joins and near-match hints are worked out again
+  const removeUser = (system: PeopleSystem, id: string) => {
+    const base = state.data;
+    if (base) {
+      state.mutate((prev) => {
+        const cur = prev ?? base;
+        const rows = cur.rows.map((r) => (r[system]?.id === id ? { ...r, [system]: null } : r)).filter((r) => r.samvadia || r.socia);
+        return { ...cur, rows };
+      });
+    }
+    invalidate("people");
   };
 
   const data = state.data;
@@ -400,6 +496,7 @@ export default function PeopleView() {
             onUser={(s, u) => replaceUser(selected.key, s, u)}
             onClose={requestClose}
             onDirty={onDirty}
+            onDeleted={removeUser}
           />
         ) : null}
       </Drawer>

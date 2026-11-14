@@ -186,4 +186,5 @@ export const getPeople = (signal?: AbortSignal) => request<PeopleOverview>("/api
 export const getPeopleHistory = (cursor?: string, signal?: AbortSignal) => request<PeopleHistory>(withQuery("/api/people/history", { limit: 50, cursor }), { signal });
 export const getPersonPermissions = (system: PeopleSystem, id: string, signal?: AbortSignal) => request<UserPermissions>(`${personPath(system, id)}/permissions`, { signal });
 export const patchPerson = (system: PeopleSystem, id: string, body: PeoplePatch) => request<{ user: OwnerUser }>(personPath(system, id), json("PATCH", body));
+export const deletePerson = (system: PeopleSystem, id: string) => request<void>(personPath(system, id), { method: "DELETE" });
 export const putPersonOverrides = (system: PeopleSystem, id: string, overrides: OwnerOverride[]) => request<UserPermissions>(`${personPath(system, id)}/overrides`, json("PUT", { overrides }));

@@ -4,7 +4,7 @@
 // before the call and once with the outcome; the backends also record it in their history with
 // actor "owner:<username>". Every answer is sent with Cache-Control: no-store (peopleJson).
 import type { HistoryEntry, PeopleHistory, PeopleOverview, PeoplePatch, PeopleSystem, SystemStatus, UserPermissions } from "@/types/people";
-import { PEOPLE_SYSTEMS, SYSTEM_LABEL } from "@/types/people";
+import { DELETABLE_SYSTEMS, PEOPLE_SYSTEMS, SYSTEM_LABEL } from "@/types/people";
 import type { Session } from "./auth";
 import { badRequest, HttpError } from "./http";
 import { NotConnected, outcomeUnknown, ownerFetch, readPeople, readPermissions, readUser, type PeopleList } from "./ownerApi";
@@ -118,6 +118,21 @@ export async function patchPerson(owner: Session, system: PeopleSystem, id: stri
     },
     // The name comes from the backend's answer, not from the browser
     ({ user }) => `${user.name} is now ${user.active ? "on" : "off"}, ${user.roleLabel}`
+  );
+}
+
+// Soft delete; only systems in DELETABLE_SYSTEMS have the owner route (the Assignment desk does not)
+export async function deletePerson(owner: Session, system: PeopleSystem, id: string, fetchImpl?: typeof fetch): Promise<void> {
+  if (!DELETABLE_SYSTEMS.includes(system)) throw badRequest(`${SYSTEM_LABEL[system]} people cannot be deleted from Sentry. Turn the account off instead.`);
+  await logged(
+    owner,
+    system,
+    id,
+    "delete",
+    async () => {
+      await ownerFetch(system, `people/${id}`, owner.u, { method: "DELETE" }, fetchImpl);
+    },
+    () => "deleted"
   );
 }
 

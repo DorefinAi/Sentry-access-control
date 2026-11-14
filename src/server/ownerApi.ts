@@ -86,7 +86,7 @@ export function readBackendError(body: unknown): { code: string; message: string
 }
 
 // Plain-words messages for the codes both backends send: unauthorized, rate_limited, invalid_actor,
-// last_admin, unknown_role, unknown_permission, duplicate_permission, not_found, invalid.
+// last_admin, self (Socia delete), unknown_role, unknown_permission, duplicate_permission, not_found, invalid.
 function backendError(system: PeopleSystem, status: number, body: unknown): HttpError {
   const label = SYSTEM_LABEL[system];
   const { code, message: theirs } = readBackendError(body);
@@ -101,6 +101,7 @@ function backendError(system: PeopleSystem, status: number, body: unknown): Http
     const who = system === "socia" ? "admin" : "super admin";
     return new HttpError(409, "last_admin", `Not saved: this is the last active ${who} in ${label}. Make someone else a ${who} first, then try again.`);
   }
+  if (status === 400 && code === "self") return new HttpError(400, "self", `${label} will not delete the account the change is made as. Ask another owner to do it.`);
   if (status === 422 && code === "unknown_role") return new HttpError(422, "unknown_role", `${label} does not know that role. Reload the page to get its current roles.`);
   if (status === 422 && code === "unknown_permission") return new HttpError(422, "unknown_permission", `${label} does not know one of those pages or actions. Reload the page to get its current list.`);
   if (status === 422 && code === "reporter_link_required") return new HttpError(422, "reporter_link_required", `Only a login linked to a reporter can have the reporter role in ${label}.`);
@@ -155,6 +156,8 @@ export async function ownerFetch(system: PeopleSystem, path: string, actor: stri
     if (write && !neverSent) throw outcomeUnknown(system);
     throw new NotConnected("unreachable", 503, timedOut ? `${label} did not answer in time.` : `Could not reach ${label}. Is it running?`);
   }
+  // A write with nothing to say back (DELETE answers 204): done, no body to read
+  if (write && res.status === 204) return null;
   let body: unknown = undefined;
   const text = await res.text().catch(() => "");
   if (text) {

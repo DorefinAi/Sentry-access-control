@@ -5,6 +5,8 @@
 export type PeopleSystem = "samvadia" | "socia";
 export const PEOPLE_SYSTEMS: PeopleSystem[] = ["samvadia", "socia"];
 export const SYSTEM_LABEL: Record<PeopleSystem, string> = { samvadia: "Assignment desk", socia: "Socia" };
+/** Systems whose owner API can delete a person (soft delete: sign-in off, gone from the lists, name kept on past work). */
+export const DELETABLE_SYSTEMS: readonly PeopleSystem[] = ["socia"];
 
 export interface CatalogueEntry {
   key: string;

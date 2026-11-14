@@ -649,6 +649,43 @@ await test("routes: 409 last_admin passes through with its code", async () => {
   }
 });
 
+await test("delete: Socia only, 204 is done, refusals keep their codes, every try is logged", async () => {
+  configure();
+  store.store().actionLog.length = 0;
+  const ok = mockFetch(() => ({ status: 204 }));
+  await people.deletePerson(OWNER, "socia", ID(2), ok.f);
+  assert.equal(ok.calls[0].method, "DELETE");
+  assert.match(ok.calls[0].url, new RegExp(`/owner/people/${ID(2)}$`));
+  const code = async (status: number, error: string) => {
+    try {
+      await people.deletePerson(OWNER, "socia", ID(2), mockFetch(() => ({ status, body: { error } })).f);
+      return "none";
+    } catch (e) {
+      return (e as { code?: string }).code;
+    }
+  };
+  assert.equal(await code(400, "self"), "self");
+  assert.equal(await code(409, "last_admin"), "last_admin");
+  assert.equal(await code(404, "not_found"), "not_found");
+  const never = mockFetch(() => ({ status: 204 }));
+  await assert.rejects(people.deletePerson(OWNER, "samvadia", ID(1), never.f), /cannot be deleted/);
+  assert.equal(never.calls.length, 0, "the Assignment desk is never asked");
+  const S = `Socia ${ID(2)}`;
+  assert.deepEqual(store.store().actionLog.slice(0, 2).map((a) => a.text), [`${S}: asked to delete`, `${S}: deleted`]);
+
+  const real = globalThis.fetch;
+  globalThis.fetch = mockFetch(() => ({ status: 204 })).f;
+  try {
+    const owner = await signIn("vansh", "10.1.0.3");
+    const res = await patchRoute.DELETE(req(`/api/people/socia/${ID(2)}`, { method: "DELETE", cookie: owner }), ctx("socia", ID(2)));
+    assert.equal(res.status, 204);
+    const badId = await patchRoute.DELETE(req("/api/people/socia/nope", { method: "DELETE", cookie: owner }), ctx("socia", "nope"));
+    assert.equal(badId.status, 400);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
 process.chdir(tmpdir());
 rmSync(dir, { recursive: true, force: true });
 console.log(`people.test: ${passed} passed`);
