@@ -1,8 +1,9 @@
 "use client";
 
 // The replay jog wheel. Endless rotation: one full turn is 2 hours, clockwise
-// goes forward. Clamped to 00:00..the board's frozen NOW (its asOf, never the
-// wall clock) with a soft stop. A quick spin keeps
+// goes forward. Clamped to the earliest moment today Sentry has stored history for
+// (fromIso) .. the live board's asOf, with a soft stop. Without stored history
+// (fromIso null) the wheel is off and says so: a replay is never made up. A quick spin keeps
 // coasting and slows down (inertia); reduced motion turns inertia off. While it
 // turns, the board is fetched at most 4 times a second, and once more at rest.
 // Keyboard: arrows 10 min, Shift+arrows 1 h, Home = 00:00, End = live.
@@ -30,13 +31,31 @@ export interface Mark {
   label: string;
 }
 
-export function JogWheel({ liveAsOf, replayAt, marks, onScrub }: { liveAsOf: string; replayAt: string | null; marks: Mark[]; onScrub: (iso: string | null) => void }) {
+export function JogWheel(props: { liveAsOf: string; fromIso: string | null; replayAt: string | null; marks: Mark[]; onScrub: (iso: string | null) => void }) {
+  if (!props.fromIso) {
+    return (
+      <Box sx={{ display: "grid", gap: 1, justifyItems: "center", textAlign: "center", py: 3 }}>
+        <Typography variant="body2" sx={{ fontWeight: 600 }}>
+          Replay is off
+        </Typography>
+        <Typography variant="caption" color="text.secondary" sx={{ maxWidth: 280 }}>
+          Sentry has no stored history for today yet. Replay turns on once it has recorded the ops status and health probes for a while.
+        </Typography>
+      </Box>
+    );
+  }
+  return <Wheel {...props} fromIso={props.fromIso} />;
+}
+
+function Wheel({ liveAsOf, fromIso, replayAt, marks, onScrub }: { liveAsOf: string; fromIso: string; replayAt: string | null; marks: Mark[]; onScrub: (iso: string | null) => void }) {
   const theme = useTheme();
   const reduced = useReducedMotion();
   const now = Date.parse(liveAsOf);
   const t0 = istMidnight(now);
   const maxSec = Math.max(KEY_STEP, Math.floor((now - t0) / 1000));
-  const committed = replayAt ? Math.min(maxSec, Math.max(0, Math.round((Date.parse(replayAt) - t0) / 1000))) : maxSec;
+  // Nothing before the first stored moment today can be replayed
+  const minSec = Math.min(maxSec, Math.max(0, Math.ceil((Date.parse(fromIso) - t0) / 1000)));
+  const committed = replayAt ? Math.min(maxSec, Math.max(minSec, Math.round((Date.parse(replayAt) - t0) / 1000))) : maxSec;
 
   // While the hand (or inertia) is on the wheel, `active` holds the position
   const [active, setActive] = useState<number | null>(null);
@@ -47,7 +66,7 @@ export function JogWheel({ liveAsOf, replayAt, marks, onScrub }: { liveAsOf: str
   const lastSent = useRef(0);
   const sendTimer = useRef<number | undefined>(undefined);
 
-  const clamp = (s: number) => Math.max(0, Math.min(maxSec, s));
+  const clamp = (s: number) => Math.max(minSec, Math.min(maxSec, s));
   const emit = (s: number) => onScrub(s >= maxSec ? null : new Date(t0 + Math.round(s) * 1000).toISOString());
 
   // At most one fetch per 250 ms while turning; the trailing call always lands
@@ -118,7 +137,7 @@ export function JogWheel({ liveAsOf, replayAt, marks, onScrub }: { liveAsOf: str
       const dt = Math.min(48, t - last);
       last = t;
       const next = clamp(pos.current + v * dt);
-      const hitEnd = next === 0 || next === maxSec;
+      const hitEnd = next === minSec || next === maxSec;
       setPos(next);
       send(next);
       v *= Math.exp(-dt / 420);
@@ -133,7 +152,7 @@ export function JogWheel({ liveAsOf, replayAt, marks, onScrub }: { liveAsOf: str
     const map: Record<string, number> = { ArrowRight: step, ArrowUp: step, ArrowLeft: -step, ArrowDown: -step, PageUp: 3600, PageDown: -3600 };
     let next: number | null = null;
     if (e.key in map) next = sec + map[e.key];
-    if (e.key === "Home") next = 0;
+    if (e.key === "Home") next = minSec;
     if (e.key === "End") next = maxSec;
     if (next === null) return;
     e.preventDefault();
@@ -159,7 +178,7 @@ export function JogWheel({ liveAsOf, replayAt, marks, onScrub }: { liveAsOf: str
         role="slider"
         tabIndex={0}
         aria-label="Replay jog wheel"
-        aria-valuemin={0}
+        aria-valuemin={minSec}
         aria-valuemax={maxSec}
         aria-valuenow={Math.round(sec)}
         aria-valuetext={live ? "Live" : `${hmIst(t0 + sec * 1000)} IST, not live`}
@@ -203,10 +222,10 @@ export function JogWheel({ liveAsOf, replayAt, marks, onScrub }: { liveAsOf: str
           1 TURN = 2 H
         </text>
       </Box>
-      <Timeline t0={t0} now={now} sec={sec} marks={marks} />
+      <Timeline t0={t0} now={now} sec={sec} minSec={minSec} marks={marks} />
       <Box sx={{ display: "flex", gap: 1, alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
         <Typography variant="caption" color="text.secondary" sx={{ textAlign: "center" }}>
-          Turn to replay today. Arrows: 10 min, Shift: 1 h, End: live.
+          Turn to replay today from {hmIst(t0 + minSec * 1000)}. Arrows: 10 min, Shift: 1 h, End: live.
         </Typography>
         {!live ? (
           <Button size="small" variant="outlined" startIcon={<Radio size={14} aria-hidden />} onClick={() => (setActive(null), onScrub(null))}>
@@ -219,12 +238,13 @@ export function JogWheel({ liveAsOf, replayAt, marks, onScrub }: { liveAsOf: str
 }
 
 /** A linear day under the wheel: position, the live moment, and outage marks. */
-function Timeline({ t0, now, sec, marks }: { t0: number; now: number; sec: number; marks: Mark[] }) {
+function Timeline({ t0, now, sec, minSec, marks }: { t0: number; now: number; sec: number; minSec: number; marks: Mark[] }) {
   const pct = (ms: number) => `${Math.max(0, Math.min(100, ((ms - t0) / (DAY * 1000)) * 100))}%`;
   return (
     <Box sx={{ width: "100%", maxWidth: 360 }} aria-hidden>
       <Box sx={{ position: "relative", height: 14, borderRadius: "2px", bgcolor: "var(--ops-screen)", border: 1, borderColor: "divider" }}>
-        <Box sx={{ position: "absolute", left: 0, top: 0, bottom: 0, width: pct(now), bgcolor: "action.selected" }} />
+        {/* the stretch with stored history; before it there is nothing to replay */}
+        <Box sx={{ position: "absolute", left: pct(t0 + minSec * 1000), top: 0, bottom: 0, width: `calc(${pct(now)} - ${pct(t0 + minSec * 1000)})`, bgcolor: "action.selected" }} />
         {marks.map((m, i) => (
           <Box key={i} title={m.label} sx={{ position: "absolute", top: 0, bottom: 0, left: pct(m.from), width: `max(3px, calc(${pct(m.to)} - ${pct(m.from)}))`, bgcolor: "error.main", opacity: 0.85 }} />
         ))}

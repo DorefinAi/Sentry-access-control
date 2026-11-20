@@ -1,6 +1,6 @@
 // Input checks for query strings and bodies. Each throws a 400 with a plain message.
 import type { LogLevel, Severity, SystemId } from "@/types/control";
-import { SYSTEM_IDS } from "@/data/systems";
+import { SYSTEM_IDS } from "./catalog";
 import { badRequest } from "./http";
 
 export const LOG_LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];

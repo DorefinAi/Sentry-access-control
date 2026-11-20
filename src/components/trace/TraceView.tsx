@@ -95,6 +95,11 @@ export default function TraceView({ slug }: { slug: string }) {
           const stopAt = stuck ? t.steps.findIndex((s) => s.state === "waiting" || s.state === "failed") : -1;
           return (
             <>
+              {t.partial ? (
+                <Typography variant="body2" color="warning.main" role="status">
+                  Part of this path is missing: {t.partial}
+                </Typography>
+              ) : null}
               <Box>
                 <Typography component="h1" sx={{ fontSize: { xs: "1.125rem", sm: "1.375rem" }, fontWeight: 700, lineHeight: 1.3 }}>
                   {t.headline}

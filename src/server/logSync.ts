@@ -4,6 +4,7 @@
 import type { LogLevel, LogSourceStatus, SystemId } from "@/types/control";
 import type { PeopleSystem } from "@/types/people";
 import { SYSTEM_LABEL } from "@/types/people";
+import { noteRefusal, pausedFor } from "./backoff";
 import { db, transaction } from "./db";
 import { NotConnected, ownerConfig, ownerEnvSet, ownerFetch } from "./ownerApi";
 import { redactFields, redactText } from "./redact";
@@ -22,7 +23,7 @@ const ALLOWED: Record<PeopleSystem, SystemId[]> = {
   socia: ["socia-api", "socia-ingest", "socia-render", "socia-publish", "socia-crons"],
 };
 
-/** Logs are live once any backend has its URL and key set; until then the demo data stays. */
+/** A backend is configured (URL and key set), so new lines come in. */
 export function logsLive(): boolean {
   return LOG_SOURCES.some(ownerEnvSet);
 }
@@ -121,6 +122,13 @@ async function newestId(source: PeopleSystem, fetchImpl?: typeof fetch): Promise
 
 /** Pulls everything new from one backend (up to MAX_PAGES_PER_PULL pages). Returns the lines stored. */
 export async function pullSource(source: PeopleSystem, fetchImpl?: typeof fetch): Promise<number> {
+  // After a refused key or a rate limit, wait before asking again (backoff.ts); the status says why
+  const pause = pausedFor(source);
+  if (pause) {
+    sourceRow(source);
+    db().prepare("UPDATE log_sources SET last_error = ? WHERE source = ?").run(pause.reason, source);
+    return 0;
+  }
   const config = ownerConfig(source);
   if (!(config instanceof NotConnected)) {
     const known = sourceRow(source).base;
@@ -168,7 +176,8 @@ export async function pullSource(source: PeopleSystem, fetchImpl?: typeof fetch)
       if (body.entries.length < PAGE || !next) break;
     }
   } catch (e) {
-    const message = e instanceof Error ? e.message.slice(0, 300) : "Pull failed.";
+    const paused = noteRefusal(source, e);
+    const message = paused ? pausedFor(source)!.reason : e instanceof Error ? e.message.slice(0, 300) : "Pull failed.";
     db().prepare("UPDATE log_sources SET last_error = ? WHERE source = ?").run(message, source);
     throw e;
   }

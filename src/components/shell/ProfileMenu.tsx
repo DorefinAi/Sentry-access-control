@@ -18,7 +18,7 @@ const isMac = () => typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(n
 
 function Shift({ since }: { since: string }) {
   const now = useSecondClock();
-  // Sign-in times are real; the second clock runs on the server's (possibly frozen) time
+  // Sign-in times and the second clock both run on the server's clock
   return <>{now ? counter((now - clockOffset() - Date.parse(since)) / 1000) : "--:--:--"}</>;
 }
 

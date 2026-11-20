@@ -1,14 +1,18 @@
-// Gauge thresholds the team can move. Kept in memory and in thresholds.local.json (gitignored)
-// so they survive a restart. Gauge health and the live X-cap alert follow them.
+// Thresholds the team can move, kept in memory and in thresholds.local.json (gitignored) so they
+// survive a restart:
+// - gauge levels (warnAt / dangerAt per dial), changed from the Overview knobs;
+// - detection rule levels under "rules" (detect/rules.ts), changed by editing the file. Missing
+//   keys get their defaults, and the defaults are written into the file once so they are easy to find.
 import { readFileSync } from "node:fs";
 import { rename, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { xCap } from "@/data/stats";
 import { badRequest, notFound } from "./http";
-import { addNotification, liveNow, recordAction, store } from "./store";
+import { addNotification } from "./notifications";
+import { recordAction } from "./store";
+import { nowIso } from "./time";
 import { isRecord } from "./validate";
 
-export type GaugeId = "x-cap" | "queue" | "uptime" | "to-feed" | "octopus-lag";
+export type GaugeId = "stuck" | "queue" | "uptime" | "to-feed" | "octopus-lag";
 
 export interface GaugeSpec {
   label: string;
@@ -20,7 +24,7 @@ export interface GaugeSpec {
 }
 
 export const GAUGE_SPECS: Record<GaugeId, GaugeSpec> = {
-  "x-cap": { label: "X cap", unit: "%", max: 100, direction: "up", warnAt: 80, dangerAt: 95 },
+  stuck: { label: "Stuck stories", unit: "stories", max: 20, direction: "up", warnAt: 1, dangerAt: 5 },
   queue: { label: "Queue depth", unit: "jobs", max: 30, direction: "up", warnAt: 10, dangerAt: 25 },
   uptime: { label: "Uptime 24h", unit: "%", max: 100, direction: "down", warnAt: 99.5, dangerAt: 99 },
   "to-feed": { label: "Median time to feed", unit: "min", max: 30, direction: "up", warnAt: 15, dangerAt: 25 },
@@ -28,10 +32,83 @@ export const GAUGE_SPECS: Record<GaugeId, GaugeSpec> = {
 };
 
 export const GAUGE_IDS = Object.keys(GAUGE_SPECS) as GaugeId[];
-const FILE = path.join(process.cwd(), "thresholds.local.json");
+
+/** Detection levels (detect/rules.ts). Times in seconds or minutes as named; hours are IST. */
+export interface RuleLevels {
+  heartbeatWarnSec: number; // a process silent this long is a warning
+  heartbeatDownSec: number; // ... and this long is down (critical)
+  heartbeatGoneSec: number; // ... and this long is "gone" (a retired process): unknown, no alert
+  errorSpikeWindowMin: number; // errors are counted over this window
+  errorSpikeMin: number; // at least this many errors in the window
+  errorSpikeFactor: number; // and this many times the normal rate (last 24 h)
+  errorRepeatCount: number; // the same error this many times...
+  errorRepeatWindowMin: number; // ...within this many minutes
+  noIntakeMinutes: number; // no story in for this long during working hours
+  workStartHour: number; // working hours, IST
+  workEndHour: number;
+  backupMaxHours: number; // the newest backup may be this old
+  quietOctopusMin: number; // in working hours, a check whose last success is older than this is "gone quiet"
+  quietWhatsappMin: number;
+  quietOutlookMin: number;
+  quietShareMin: number;
+  stuckMinMinutes: number; // Sentry's own floor on top of the backends' stuck limits (0 = take theirs)
+  autoIncidentMinutes: number; // a critical alert open this long opens an incident
+  opsStaleSec: number; // an ops summary older than this is not used
+}
+
+export const RULE_DEFAULTS: RuleLevels = {
+  heartbeatWarnSec: 90,
+  heartbeatDownSec: 300,
+  heartbeatGoneSec: 3600,
+  errorSpikeWindowMin: 10,
+  errorSpikeMin: 5,
+  errorSpikeFactor: 3,
+  errorRepeatCount: 5,
+  errorRepeatWindowMin: 30,
+  noIntakeMinutes: 60,
+  workStartHour: 8,
+  workEndHour: 23,
+  backupMaxHours: 26,
+  quietOctopusMin: 15,
+  quietWhatsappMin: 120,
+  quietOutlookMin: 60,
+  quietShareMin: 60,
+  stuckMinMinutes: 0,
+  autoIncidentMinutes: 5,
+  opsStaleSec: 120,
+};
+
+const RULE_LIMITS: Record<keyof RuleLevels, [number, number]> = {
+  heartbeatWarnSec: [10, 3600],
+  heartbeatDownSec: [10, 86_400],
+  heartbeatGoneSec: [60, 30 * 86_400],
+  errorSpikeWindowMin: [1, 120],
+  errorSpikeMin: [1, 100_000],
+  errorSpikeFactor: [1, 1000],
+  errorRepeatCount: [2, 100_000],
+  errorRepeatWindowMin: [1, 1440],
+  noIntakeMinutes: [5, 1440],
+  workStartHour: [0, 23],
+  workEndHour: [1, 24],
+  backupMaxHours: [1, 24 * 30],
+  quietOctopusMin: [1, 1440],
+  quietWhatsappMin: [1, 1440],
+  quietOutlookMin: [1, 1440],
+  quietShareMin: [1, 1440],
+  stuckMinMinutes: [0, 1440],
+  autoIncidentMinutes: [0, 1440],
+  opsStaleSec: [30, 3600],
+};
+
+const FILE = () => path.join(process.cwd(), "thresholds.local.json");
 
 type Levels = Record<GaugeId, { warnAt: number; dangerAt: number }>;
-const g = globalThis as typeof globalThis & { __sentryThresholds?: Levels };
+interface Saved {
+  levels: Levels;
+  rules: RuleLevels;
+  file: string;
+}
+const g = globalThis as typeof globalThis & { __sentryThresholds?: Saved };
 
 function valid(id: GaugeId, warnAt: number, dangerAt: number): string | null {
   const { max, direction } = GAUGE_SPECS[id];
@@ -42,21 +119,54 @@ function valid(id: GaugeId, warnAt: number, dangerAt: number): string | null {
   return null;
 }
 
-export function thresholds(): Levels {
-  if (g.__sentryThresholds) return g.__sentryThresholds;
+function load(): Saved {
+  const file = FILE();
+  if (g.__sentryThresholds?.file === file) return g.__sentryThresholds;
   const levels = Object.fromEntries(GAUGE_IDS.map((id) => [id, { warnAt: GAUGE_SPECS[id].warnAt, dangerAt: GAUGE_SPECS[id].dangerAt }])) as Levels;
+  const rules: RuleLevels = { ...RULE_DEFAULTS };
+  let raw: Record<string, unknown> | null = null;
+  let readable = true;
   try {
-    const saved = JSON.parse(readFileSync(FILE, "utf8")) as Record<string, { warnAt?: unknown; dangerAt?: unknown }>;
-    for (const id of GAUGE_IDS) {
-      const s = saved[id];
-      if (s && typeof s.warnAt === "number" && typeof s.dangerAt === "number" && !valid(id, s.warnAt, s.dangerAt)) {
-        levels[id] = { warnAt: s.warnAt, dangerAt: s.dangerAt };
-      }
-    }
-  } catch {
-    // No file yet, or unreadable: defaults.
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    raw = isRecord(parsed) ? parsed : null;
+  } catch (e) {
+    // No file yet: defaults. Unreadable or not JSON: defaults, and the file is left alone.
+    readable = (e as NodeJS.ErrnoException).code === "ENOENT";
   }
-  return (g.__sentryThresholds = levels);
+  if (raw) {
+    for (const id of GAUGE_IDS) {
+      const s = raw[id];
+      if (isRecord(s) && typeof s.warnAt === "number" && typeof s.dangerAt === "number" && !valid(id, s.warnAt, s.dangerAt)) levels[id] = { warnAt: s.warnAt, dangerAt: s.dangerAt };
+    }
+    const r = isRecord(raw.rules) ? raw.rules : {};
+    for (const k of Object.keys(RULE_DEFAULTS) as (keyof RuleLevels)[]) {
+      const v = r[k];
+      const [lo, hi] = RULE_LIMITS[k];
+      if (typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi) rules[k] = v;
+    }
+    if (rules.heartbeatDownSec <= rules.heartbeatWarnSec) rules.heartbeatDownSec = Math.max(RULE_DEFAULTS.heartbeatDownSec, rules.heartbeatWarnSec + 1);
+    if (rules.heartbeatGoneSec <= rules.heartbeatDownSec) rules.heartbeatGoneSec = Math.max(RULE_DEFAULTS.heartbeatGoneSec, rules.heartbeatDownSec + 1);
+    if (rules.workEndHour <= rules.workStartHour) Object.assign(rules, { workStartHour: RULE_DEFAULTS.workStartHour, workEndHour: RULE_DEFAULTS.workEndHour });
+  }
+  const saved = (g.__sentryThresholds = { levels, rules, file });
+  // Write the rule defaults into the file once, so the team can see and change them there
+  const missing = !raw || !isRecord(raw.rules) || Object.keys(RULE_DEFAULTS).some((k) => !(k in (raw!.rules as Record<string, unknown>)));
+  if (readable && missing) void save(saved).catch((e) => console.error(`[thresholds] could not write thresholds.local.json: ${(e as Error).message}`));
+  return saved;
+}
+
+export function thresholds(): Levels {
+  return load().levels;
+}
+
+export function ruleThresholds(): RuleLevels {
+  return load().rules;
+}
+
+/** For tests: forget what was loaded, so the next read comes from the file (or the defaults). */
+export function resetThresholds(rules?: Partial<RuleLevels>): void {
+  g.__sentryThresholds = undefined;
+  if (rules) Object.assign(load().rules, rules);
 }
 
 export function isGaugeId(id: string): id is GaugeId {
@@ -77,21 +187,28 @@ export function parseThresholdPatch(id: string, body: unknown): { warnAt: number
   return next;
 }
 
-async function save(levels: Levels) {
-  const tmp = `${FILE}.tmp`;
-  await writeFile(tmp, JSON.stringify(levels, null, 2) + "\n");
-  await rename(tmp, FILE);
+// One write at a time; the in-memory value changes only after the file is saved
+let writing: Promise<void> = Promise.resolve();
+function save(s: Saved): Promise<void> {
+  const body = JSON.stringify({ ...s.levels, rules: s.rules }, null, 2) + "\n";
+  const run = writing.then(async () => {
+    const tmp = `${s.file}.tmp`;
+    await writeFile(tmp, body);
+    await rename(tmp, s.file);
+  });
+  writing = run.catch(() => undefined);
+  return run;
 }
 
 const fmt = (id: GaugeId, n: number) => `${n}${GAUGE_SPECS[id].unit === "%" ? "%" : ` ${GAUGE_SPECS[id].unit}`}`;
 
 export async function setThreshold(id: GaugeId, next: { warnAt: number; dangerAt: number }, actor: string): Promise<void> {
-  const levels = thresholds();
-  const before = levels[id];
-  levels[id] = next;
-  await save(levels);
+  const s = load();
+  const before = s.levels[id];
+  await save({ ...s, levels: { ...s.levels, [id]: next } });
+  s.levels[id] = next;
 
-  const at = liveNow();
+  const at = nowIso();
   const changes = [
     before.warnAt !== next.warnAt ? `${GAUGE_SPECS[id].label} warning to ${fmt(id, next.warnAt)}` : null,
     before.dangerAt !== next.dangerAt ? `${GAUGE_SPECS[id].label} danger to ${fmt(id, next.dangerAt)}` : null,
@@ -100,31 +217,5 @@ export async function setThreshold(id: GaugeId, next: { warnAt: number; dangerAt
     const text = `${actor} set ${changes.join(" and ")}`;
     recordAction({ at, user: actor, kind: "settings", text });
     addNotification({ at, kind: "team_change", severity: "info", title: text, body: "Gauge threshold changed", evidence: [] });
-  }
-  if (id === "x-cap") reevaluateXCap(actor);
-}
-
-// The X-cap rule fires at the warning level. Moving the level re-checks the live alert:
-// below it, the alert clears; back over it, an alert cleared this way opens again.
-function reevaluateXCap(actor: string) {
-  const { warnAt } = thresholds()["x-cap"];
-  const cap = xCap();
-  const alert = store().alerts.find((a) => a.ruleId === "x-cap");
-  if (!alert) return;
-  const at = liveNow();
-  const ev = [{ kind: "alert" as const, id: alert.id, label: alert.id }];
-  if (cap.pct < warnAt && alert.state !== "resolved") {
-    alert.state = "resolved";
-    alert.resolvedAt = at;
-    alert.note = `Cleared: ${cap.pct}% is below the new warning level ${warnAt}% (set by ${actor})`;
-    alert.noteHistory = [...(alert.noteHistory ?? []), { at, text: alert.note, by: actor }];
-    addNotification({ at, kind: "alert_resolved", severity: "info", title: `Resolved: ${alert.title}`, body: alert.note, evidence: ev });
-  } else if (cap.pct >= warnAt && alert.state === "resolved" && alert.note?.startsWith("Cleared:")) {
-    alert.state = "open";
-    alert.resolvedAt = null;
-    alert.ackedAt = null;
-    alert.note = `Open again: ${cap.pct}% is at or over the warning level ${warnAt}% (set by ${actor})`;
-    alert.noteHistory = [...(alert.noteHistory ?? []), { at, text: alert.note, by: actor }];
-    addNotification({ at, kind: "alert_fired", severity: alert.severity, title: `Reopened: ${alert.title}`, body: alert.note, evidence: ev });
   }
 }

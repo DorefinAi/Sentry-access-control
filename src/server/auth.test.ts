@@ -236,12 +236,13 @@ await test("nobody resets their own password through the team PATCH", async () =
 
 await test("failed-login usernames are hidden below admin", async () => {
   await session.login(req("/api/auth/login"), { username: "my-password-typed-here", password: "x" });
-  const { ist } = await load<typeof import("../data/time")>("../data/time.ts");
-  const date = ist(Date.now()).slice(0, 10);
-  const failedUsers = (reveal: boolean) => logins.loginReport(date, "sentry", { revealFailedUsers: reveal }).events.filter((e) => e.result !== "success").map((e) => e.user);
+  const { todayIst } = await load<typeof import("./time")>("./time.ts");
+  const date = todayIst();
+  const failedUsers = async (reveal: boolean) => (await logins.loginReport(date, "sentry", { revealFailedUsers: reveal })).events.filter((e) => e.result !== "success").map((e) => e.user);
   // Earlier tests' failed tries are there too: the sign-in log now survives a restart (audit.local.json)
-  assert.ok(failedUsers(false).length > 0 && failedUsers(false).every((u) => u === logins.HIDDEN_USER));
-  assert.ok(failedUsers(true).includes("my-password-typed-here"));
+  const hidden = await failedUsers(false);
+  assert.ok(hidden.length > 0 && hidden.every((u) => u === logins.HIDDEN_USER));
+  assert.ok((await failedUsers(true)).includes("my-password-typed-here"));
 });
 
 // ─── Owner role ─────────────────────────────────────────────────────────────
@@ -269,6 +270,11 @@ await test("the last admin-or-owner cannot be demoted or disabled", async () => 
   await assert.rejects(team.patchTeamUser("olga", { disabled: true }, owner), (e: unknown) => e instanceof http.HttpError && e.status === 409);
 });
 
+(globalThis as { __sentryDb?: { db: { close(): void } } }).__sentryDb?.db.close(); // the logins report and the routes open sentry.local.db
 process.chdir(tmpdir());
-rmSync(dir, { recursive: true, force: true });
+try {
+  rmSync(dir, { recursive: true, force: true });
+} catch {
+  // Windows can hold the WAL files a moment longer; the temp folder is cleaned by the OS
+}
 console.log(`auth: ${passed} checks passed`);

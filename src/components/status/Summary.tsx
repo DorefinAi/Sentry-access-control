@@ -25,7 +25,7 @@ function BoardTime({ asOf, replay }: { asOf: string; replay: boolean }) {
   return <>{hmsIst(ms)}</>;
 }
 
-/** Shift time runs on the real clock: sign-in times are real even while the board is frozen. */
+/** Shift time runs on the real clock, even while the board shows a replay. */
 function ShiftTime({ since }: { since: string }) {
   const now = useSecondClock();
   return <>{now ? counter((now - clockOffset() - Date.parse(since)) / 1000) : "--:--:--"}</>;

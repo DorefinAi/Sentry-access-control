@@ -3,7 +3,7 @@
 // account and the session list: a sign-out, a disabled user, a role change or a password reset
 // takes effect on the next request, also after a restart.
 import type { ApiError, Evidence, LoginRequest, LoginResponse, Profile, SessionInfo } from "@/types/control";
-import { at, ist, ms, TODAY } from "@/data/time";
+import { ist, istDate, ms, todayIst } from "./time";
 import { authConfig, clearSessionCookie, readCookie, ROLE_RANK, SESSION_COOKIE, sessionCookie, signSession, verifySession, type RoleId, type Session } from "./auth";
 import { badRequest, HttpError } from "./http";
 import { addSession, checkToken, endSession, endSessionsOf, listSessions, touchSession, type Checked } from "./liveSessions";
@@ -276,25 +276,12 @@ function lastLoginBefore(session: Session): { at: string; ip: string } | null {
 
 // ─── Profile ────────────────────────────────────────────────────────────────
 
-// What vansh did today before this server started (matches the alert and incident history).
-const STATIC_ACTIONS: Action[] = [
-  { at: at("09:16"), user: "vansh", kind: "ack", text: "Acked ALR-0100: Outlook email moved to mail_dead", evidence: [{ kind: "alert", id: "ALR-0100", label: "ALR-0100" }] },
-  { at: at("09:31"), user: "vansh", kind: "resolve", text: "Resolved ALR-0100 after Kota bureau resent the mail", evidence: [{ kind: "alert", id: "ALR-0100", label: "ALR-0100" }] },
-  { at: at("11:44"), user: "vansh", kind: "ack", text: "Acked ALR-0101: Octopus not polling", evidence: [{ kind: "alert", id: "ALR-0101", label: "ALR-0101" }] },
-  { at: at("11:47"), user: "vansh", kind: "incident_note", text: "Note on INC-0007: called Octopus IT", evidence: [{ kind: "incident", id: "INC-0007", label: "INC-0007" }] },
-  { at: at("15:46"), user: "vansh", kind: "ack", text: "Acked ALR-0104: X cap, watching it", evidence: [{ kind: "alert", id: "ALR-0104", label: "ALR-0104" }] },
-  { at: at("15:46"), user: "vansh", kind: "note", text: "Note on ALR-0104: fake mode, nothing really posts", evidence: [{ kind: "alert", id: "ALR-0104", label: "ALR-0104" }] },
-];
-
 export async function buildProfile(session: Session, lastLogin = lastLoginBefore(session)): Promise<Profile> {
   const user = await findUser(session.u);
   const name = user?.name ?? session.u;
-  // Saved actions from earlier runs share the demo clock's "today", so only this run's count
-  // (realAt at or after this process started); the demo seeds have no realAt.
-  const bootedAt = store().bootedAt;
-  const actions = [...STATIC_ACTIONS, ...store().actionLog].filter(
-    (a) => a.user === session.u && a.at.startsWith(TODAY) && (!a.realAt || Date.parse(a.realAt) >= bootedAt),
-  );
+  // Today's actions (IST) by this person, from the saved action log
+  const today = todayIst();
+  const actions = store().actionLog.filter((a) => a.user === session.u && istDate(a.at) === today);
   const count = (...kinds: Action["kind"][]) => actions.filter((a) => kinds.includes(a.kind)).length;
   return {
     username: session.u,

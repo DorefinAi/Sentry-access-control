@@ -1,6 +1,6 @@
 // The control centre's contract: every API route returns one of these shapes, and every screen reads them.
-// Phase 1 serves typed static data from src/data/. Later phases swap the source inside the route handlers;
-// these types stay put. Times are ISO 8601 strings with offset (IST, +05:30).
+// Everything is live: the backends' ops and log endpoints, Sentry's own probes, and the alerts,
+// incidents and history Sentry stores in sentry.local.db. Times are ISO 8601 strings with an offset.
 
 export type Health = "ok" | "warn" | "down" | "unknown";
 export type Severity = "critical" | "warning" | "info";
@@ -107,6 +107,7 @@ export interface Overview {
   // Mission-control summary (phase 1 redesign)
   asOf: string; // the moment this board describes: generatedAt, or the replay time when ?at= is given
   replay: boolean; // true when ?at= asked for a past moment
+  replayFrom: string | null; // the earliest moment today that stored history can replay; null = no history, replay is off
   uptime: StackUptime;
   streaks: UptimeStreak[]; // one per system, longest current streak first
   telemetry: TelemetryPoint[]; // today in 10-minute buckets, up to asOf
@@ -362,9 +363,10 @@ export interface LogQuery {
   slug?: string;
   cursor?: string;
   limit?: number; // default 100, max 500
-  // A preset counted from the server's clock (real time for live logs, the frozen demo time otherwise).
-  // Used when from/to are not given.
+  // A preset counted from the server's clock. Used when from/to are not given.
   range?: LogRange;
+  // true: include the HTTP request lines ("incoming request" / "request completed"); hidden by default
+  noise?: boolean;
 }
 
 export type LogRange = "15m" | "1h" | "6h" | "24h" | "today" | "all";
@@ -379,13 +381,27 @@ export interface LogSourceStatus {
   processes: { process: string; system: string; host: string; startedAt: string; beatAt: string }[];
 }
 
+/** One error message and how often it came in the window (the Logs page groups repeats). */
+export interface LogErrorGroup {
+  message: string;
+  system: SystemId;
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+  firstId: string; // the oldest line of the group
+}
+
 export interface LogPage {
-  // true: real lines pulled from the backends; false: the Phase 1 demo data (no backend configured)
+  // true: at least one backend is configured; false: none is, so there are no lines to show
   live: boolean;
   sources: LogSourceStatus[];
   entries: LogEntry[]; // newest first
   nextCursor: string | null;
   total: number; // matching entries in the window
+  // HTTP request lines left out of this view (when noise is off), with their average rate
+  noise?: { hidden: number; perMinute: number };
+  // The most common error messages in the window (same filters), most frequent first, at most 10
+  errorGroups?: LogErrorGroup[];
 }
 
 // ─── Trace ──────────────────────────────────────────────────────────────────
@@ -410,6 +426,12 @@ export interface Trace {
   state: "on_track" | "stuck" | "failed" | "done";
   stuckAt?: string | null; // the stage label where it stopped
   steps: TraceStep[]; // oldest first
+  partial?: string | null; // set when a backend could not be asked: its part of the path is missing
+}
+
+export interface TraceSearchResult {
+  hits: TraceSearchHit[];
+  partial: string | null; // set when a backend could not be searched: its stories are missing
 }
 
 export interface TraceSearchHit {
@@ -519,13 +541,28 @@ export interface LoginEvent {
   flags: ("new_ip" | "off_hours" | "repeated_failures")[];
 }
 
+/** Where a backend's sign-ins came from, so missing numbers are never shown as zeros. */
+export interface LoginSource {
+  source: "samvadia" | "socia";
+  label: string; // "Assignment desk", "Socia"
+  apps: AppName[]; // the apps this backend serves
+  state: "ok" | "stale" | "unreachable" | "not_connected"; // stale: the last good answer, shown with asOf
+  asOf: string | null; // when this answer was read
+  message: string | null; // why it is not ok
+  truncated: boolean; // the backend cut its event list at its cap; totals are still exact
+  totals: { success: number; failed: number } | null; // the backend's true counts for the day (null: older backend, counted from events)
+}
+
 export interface LoginReport {
   date: string;
+  // success / failed: the backends' true day totals when they send them, else counted from the events
   totals: { success: number; failed: number; uniqueUsers: number; activeSessions: number };
-  byApp: { app: AppName; success: number; failed: number; activeSessions: number }[];
+  byApp: { app: AppName; success: number; failed: number; activeSessions: number }[]; // counted from the events (see sources[].truncated)
+  sources: LoginSource[];
   unusual: LoginEvent[]; // anything with a flag
-  activeSessions: { app: AppName; user: string; since: string; lastSeen: string; ip: string }[];
-  events: LoginEvent[]; // newest first
+  // user is "(hidden)" and ip null below admin; lastSeen / ip null when the backend does not know
+  activeSessions: { app: AppName; user: string; since: string; lastSeen: string | null; ip: string | null }[];
+  events: LoginEvent[]; // newest first; below admin, failed tries hide user/name/role and every event hides ip/userAgent
 }
 
 export interface BuildLogEntry {
@@ -577,7 +614,7 @@ export const SUGGESTED_QUESTIONS = [
   "Daily report",
   "Who logged in?",
   "What should I fix first?",
-  "Where is slug 271026_JPR_RAIN_AV_POOJA?",
+  "Where is a story?",
 ] as const;
 
 // ─── Errors ─────────────────────────────────────────────────────────────────

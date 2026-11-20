@@ -132,6 +132,11 @@ await test("the sign-in log is capped, failed tries going before successes", () 
   assert.equal(wins[0].id, "e2", "only successes: the oldest go");
 });
 
+(globalThis as { __sentryDb?: { db: { close(): void } } }).__sentryDb?.db.close(); // the logins report and the routes open sentry.local.db
 process.chdir(tmpdir());
-rmSync(dir, { recursive: true, force: true });
+try {
+  rmSync(dir, { recursive: true, force: true });
+} catch {
+  // Windows can hold the WAL files a moment longer; the temp folder is cleaned by the OS
+}
 console.log(`guards.test: ${passed} passed`);

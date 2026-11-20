@@ -40,7 +40,7 @@ import type {
   System,
   SystemDetail,
   Trace,
-  TraceSearchHit,
+  TraceSearchResult,
 } from "@/types/control";
 import type { OwnerOverride, OwnerUser, PeopleHistory, PeopleOverview, PeoplePatch, PeopleSystem, UserPermissions } from "@/types/people";
 
@@ -145,12 +145,13 @@ export function logQueryParams(q: LogQuery): Params {
     slug: q.slug,
     cursor: q.cursor,
     limit: q.limit,
+    noise: q.noise ? 1 : undefined,
   };
 }
 export const getLogs = (q: LogQuery, signal?: AbortSignal) => request<LogPage>(withQuery("/api/logs", logQueryParams(q)), { signal });
 export const getLog = (id: string, signal?: AbortSignal) => request<LogEntry>(`/api/logs/${encodeURIComponent(id)}`, { signal });
 
-export const searchTrace = (q: string, signal?: AbortSignal) => request<TraceSearchHit[]>(withQuery("/api/trace", { q }), { signal });
+export const searchTrace = (q: string, signal?: AbortSignal) => request<TraceSearchResult>(withQuery("/api/trace", { q }), { signal });
 export const getTrace = (slug: string, signal?: AbortSignal) => request<Trace>(`/api/trace/${encodeURIComponent(slug)}`, { signal });
 
 export const getFixes = (signal?: AbortSignal) => request<Fix[]>("/api/fixes", { signal });

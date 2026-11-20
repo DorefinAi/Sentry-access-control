@@ -1,6 +1,7 @@
-// "Now" as the server sees it. Phase 1 serves a frozen world (NOW is fixed in
-// src/data), so relative times and time-range filters must count from the
-// server's clock, not the browser's. Later phases make the offset ~0.
+// "Now" as the server sees it: relative times and time-range filters count from
+// the server's clock, not the browser's, so a browser with a wrong clock still
+// shows the right "2 min ago". The server runs on the real clock, so the offset
+// is usually close to 0.
 let offsetMs = 0;
 let synced = false;
 const listeners = new Set<() => void>();

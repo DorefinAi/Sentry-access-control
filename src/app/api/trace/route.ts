@@ -9,6 +9,6 @@ export function GET(req: Request) {
     await requireSession(req);
     const q = new URL(req.url).searchParams.get("q");
     if (q && q.length > 100) throw badRequest("q is too long (max 100 characters).");
-    return Response.json(searchTraces(q));
+    return Response.json(await searchTraces(q));
   });
 }

@@ -3,7 +3,7 @@
 // an owner or change an owner's account; nobody resets their own password here (Settings > Account
 // asks for the current one).
 import type { TeamRole, TeamUser, TeamUserCreate, TeamUserPatch } from "@/types/control";
-import { ms } from "@/data/time";
+import { ms } from "./time";
 import { ROLE_RANK, type Session } from "./auth";
 import { badRequest, conflict, HttpError, notFound } from "./http";
 import { listSessions, type StoredSession } from "./liveSessions";

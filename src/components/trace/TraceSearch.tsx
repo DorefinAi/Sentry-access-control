@@ -26,7 +26,7 @@ export function TraceSearch({ initial = "", autoFocus }: { initial?: string; aut
   const onKey = (e: KeyboardEvent) => {
     if (e.key !== "Enter") return;
     e.preventDefault();
-    const top = hits.data?.[0]?.slug ?? q.trim();
+    const top = hits.data?.hits[0]?.slug ?? q.trim();
     if (top) router.push(`/trace/${encodeURIComponent(top)}`);
   };
 
@@ -46,17 +46,22 @@ export function TraceSearch({ initial = "", autoFocus }: { initial?: string; aut
         sx={{ "& .MuiOutlinedInput-root": { bgcolor: "background.paper" } }}
       />
       <Box id={listId} aria-live="polite" sx={{ mt: term.length >= 2 ? 1 : 0 }}>
+        {term.length >= 2 && hits.data?.partial ? (
+          <Typography variant="body2" color="warning.main" sx={{ px: 0.5, mb: 0.5 }}>
+            Partial results: {hits.data.partial}
+          </Typography>
+        ) : null}
         {term.length < 2 ? null : hits.error ? (
           <ErrorNote error={hits.error} what="matches" onRetry={hits.reload} />
         ) : !hits.data ? (
           <LoadingRows rows={2} height={48} />
-        ) : hits.data.length === 0 ? (
+        ) : hits.data.hits.length === 0 ? (
           <Typography variant="body2" color="text.secondary" sx={{ px: 0.5 }}>
             No story matches “{term}”. Check the slug, or try a word from the headline.
           </Typography>
         ) : (
           <Box component="ul" aria-label="Matching stories" sx={{ ...cardSx, listStyle: "none", m: 0, p: 0, overflow: "hidden" }}>
-            {hits.data.map((h) => (
+            {hits.data.hits.map((h) => (
               <Box component="li" key={h.slug} sx={{ "& + &": { borderTop: 1, borderColor: "divider" } }}>
                 <Box component={Link} href={`/trace/${encodeURIComponent(h.slug)}`} sx={{ display: "block", px: 1.5, py: 1, color: "text.primary", textDecoration: "none", "&:hover": { bgcolor: "action.hover" } }}>
                   <Box sx={{ display: "flex", gap: 1, justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap" }}>

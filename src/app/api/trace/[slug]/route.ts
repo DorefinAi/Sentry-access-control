@@ -7,6 +7,6 @@ export const dynamic = "force-dynamic";
 export function GET(req: Request, { params }: { params: Promise<{ slug: string }> }) {
   return handle(req, async () => {
     await requireSession(req);
-    return Response.json(getTrace((await params).slug));
+    return Response.json(await getTrace((await params).slug));
   });
 }

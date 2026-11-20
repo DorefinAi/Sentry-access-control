@@ -148,7 +148,7 @@ export default function OverviewView() {
               )}
             </Panel>
             <Panel n={2} title="Replay" id="replay">
-              <JogWheel liveAsOf={liveBoard.asOf} replayAt={replayAt} marks={outageMarks(liveBoard)} onScrub={setReplay} />
+              <JogWheel liveAsOf={liveBoard.asOf} fromIso={liveBoard.replayFrom} replayAt={replayAt} marks={outageMarks(liveBoard)} onScrub={setReplay} />
             </Panel>
           </Box>
           <Box sx={{ display: "grid", gap: 1.5, gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1fr) minmax(0, 1fr)" }, alignItems: "start" }}>

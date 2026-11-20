@@ -7,7 +7,7 @@ import type { OwnerUser, PeopleSystem } from "@/types/people";
 import { SYSTEM_LABEL } from "@/types/people";
 import { DISPLAY_STACK } from "@/providers/MuiProvider";
 
-/** A time from a backend, shown exactly in IST (the console's own clock is a frozen demo day). */
+/** A time from a backend, shown exactly in IST (not relative, so it reads the same in every view). */
 export function When({ iso, prefix }: { iso: string; prefix?: string }) {
   const valid = !Number.isNaN(Date.parse(iso));
   return (

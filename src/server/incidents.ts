@@ -1,11 +1,18 @@
-import type { Incident, IncidentCreate, IncidentPatch, IncidentStatus, IncidentSummary } from "@/types/control";
-import type { IncidentRecord } from "@/data/incidents";
-import { SYSTEM_BY_ID } from "@/data/systems";
-import { hhmm } from "@/data/time";
+// Incidents, stored in sentry.local.db. People open them by hand; the detection engine opens one
+// automatically (openedBy "auto") when a critical alert stays open, and moves it to monitoring
+// once all its alerts are resolved (detect/engine.ts). Every change is written at once.
+import type { Evidence, Incident, IncidentCreate, IncidentEvent, IncidentPatch, IncidentStatus, IncidentSummary } from "@/types/control";
 import { withDraft } from "./ai/summary";
+import { activeAlertRecords, alertRecords, getAlertRecord, saveAlert } from "./alerts";
+import { systemName } from "./catalog";
+import { db, transaction } from "./db";
 import { badRequest, conflict, notFound } from "./http";
-import { addNotification, liveNow, recordAction, store } from "./store";
+import { addNotification } from "./notifications";
+import { recordAction } from "./store";
+import { hhmm, ms, nowIso } from "./time";
 import { isRecord, oneOf, SEVERITIES, singleLine, systemList, text } from "./validate";
+
+export type IncidentRecord = Omit<Incident, "aiDraft">;
 
 const STATUSES: IncidentStatus[] = ["open", "monitoring", "resolved"];
 
@@ -23,18 +30,84 @@ export function toSummary(i: IncidentRecord): IncidentSummary {
   };
 }
 
+function parse(data: string): IncidentRecord | null {
+  try {
+    return JSON.parse(data) as IncidentRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Incidents, newest first: every one (capped), or only those not resolved yet. */
+export function incidentRecords({ unresolved = false, limit = 500 }: { unresolved?: boolean; limit?: number } = {}): IncidentRecord[] {
+  const sql = `SELECT data FROM incidents ${unresolved ? "WHERE status != 'resolved'" : ""} ORDER BY opened_ms DESC, seq DESC LIMIT ?`;
+  return (db().prepare(sql).all(limit) as { data: string }[]).map((r) => parse(r.data)).filter((i): i is IncidentRecord => i !== null);
+}
+
+/** Drops resolved incidents opened more than `days` ago. */
+export function pruneIncidents(now: number, days = 180): number {
+  return Number(db().prepare("DELETE FROM incidents WHERE status = 'resolved' AND opened_ms < ?").run(now - days * 86_400_000).changes);
+}
+
+export function saveIncident(i: IncidentRecord): void {
+  db().prepare("UPDATE incidents SET status = ?, data = ? WHERE id = ?").run(i.status, JSON.stringify(i), i.id);
+}
+
+/** Stores a new incident with the next id (INC-0001, ...). */
+export function insertIncident(i: Omit<IncidentRecord, "id">): IncidentRecord {
+  return transaction((d) => {
+    const seq = ((d.prepare("SELECT max(seq) AS s FROM incidents").get() as { s: number | null }).s ?? 0) + 1;
+    const rec = { ...i, id: `INC-${String(seq).padStart(4, "0")}` } as IncidentRecord;
+    d.prepare("INSERT INTO incidents (id, seq, status, opened_ms, data) VALUES (?, ?, ?, ?, ?)").run(rec.id, seq, rec.status, ms(rec.openedAt), JSON.stringify(rec));
+    return rec;
+  });
+}
+
+/** Adds one line to an incident's timeline (no-op when the incident is gone). */
+export function appendIncidentEvent(id: string, event: IncidentEvent): void {
+  const row = db().prepare("SELECT data FROM incidents WHERE id = ?").get(id) as { data: string } | undefined;
+  const i = row ? parse(row.data) : null;
+  if (!i) return;
+  i.timeline.push(event);
+  saveIncident(i);
+}
+
 export function listIncidents(): IncidentSummary[] {
-  return [...store().incidents].sort((a, b) => Date.parse(b.openedAt) - Date.parse(a.openedAt)).map(toSummary);
+  return incidentRecords().map(toSummary);
+}
+
+/** The incidents as they stood at moment t (replay): opened by then, timeline cut at t. */
+export function incidentsAt(t: number): IncidentRecord[] {
+  return incidentRecords()
+    .filter((i) => ms(i.openedAt) <= t)
+    .map((i) => {
+      const timeline = i.timeline.filter((e) => ms(e.at) <= t);
+      // The status then: the last status line before t that names one, else open
+      let status: IncidentStatus = "open";
+      for (const e of timeline) {
+        if (e.kind !== "status") continue;
+        const m = / to (open|monitoring|resolved)\b/.exec(e.text);
+        if (m) status = m[1] as IncidentStatus;
+      }
+      const resolved = !!i.resolvedAt && ms(i.resolvedAt) <= t;
+      if (resolved) status = "resolved";
+      return { ...i, timeline, status, resolvedAt: resolved ? i.resolvedAt : null };
+    });
 }
 
 function record(id: string): IncidentRecord {
-  const found = store().incidents.find((i) => i.id === id.toUpperCase());
+  const row = db().prepare("SELECT data FROM incidents WHERE id = ?").get(id.toUpperCase()) as { data: string } | undefined;
+  const found = row ? parse(row.data) : null;
   if (!found) throw notFound(`There is no incident ${id}.`);
   return found;
 }
 
+export function getIncidentRecord(id: string): IncidentRecord {
+  return record(id);
+}
+
 export function getIncident(id: string): Incident {
-  return withDraft(record(id), liveNow());
+  return withDraft(record(id), nowIso());
 }
 
 export function parseIncidentCreate(body: unknown): IncidentCreate {
@@ -48,11 +121,12 @@ export function parseIncidentCreate(body: unknown): IncidentCreate {
     if (!Array.isArray(body.alertIds) || body.alertIds.some((a) => typeof a !== "string")) {
       throw badRequest("alertIds must be a list of alert ids.");
     }
-    const known = new Set(store().alerts.map((a) => a.id));
+    const all = alertRecords();
+    const known = new Set(all.map((a) => a.id));
     const bad = (body.alertIds as string[]).filter((a) => !known.has(a));
     if (bad.length) throw badRequest(`Unknown alert: ${bad.join(", ")}.`);
     alertIds = [...new Set(body.alertIds as string[])];
-    const taken = store().alerts.filter((a) => alertIds!.includes(a.id) && a.incidentId);
+    const taken = all.filter((a) => alertIds!.includes(a.id) && a.incidentId);
     if (taken.length) {
       throw conflict(taken.map((a) => `Alert ${a.id} already belongs to ${a.incidentId}.`).join(" ") + " Add a note there instead, or leave it out.");
     }
@@ -60,13 +134,23 @@ export function parseIncidentCreate(body: unknown): IncidentCreate {
   return { title, severity, systems: [...new Set(systems)], alertIds };
 }
 
+/** Links an alert to an incident (the alert is saved; the caller saves the incident). */
+export function linkAlert(incident: IncidentRecord, alertId: string, at: string): void {
+  const alert = getAlertRecord(alertId);
+  alert.incidentId = incident.id;
+  saveAlert(alert);
+  if (!incident.alertIds.includes(alert.id)) incident.alertIds.push(alert.id);
+  for (const s of alert.systems) if (!incident.systems.includes(s)) incident.systems.push(s);
+  incident.timeline.push({ at, kind: "alert", text: `Linked alert: ${alert.title}`, evidence: [{ kind: "alert", id: alert.id, label: alert.id }] });
+  for (const ev of alert.evidence) {
+    if (ev.kind === "trace" && !incident.affectedSlugs.includes(ev.id)) incident.affectedSlugs.push(ev.id);
+  }
+  incident.impact.storiesDelayed = incident.affectedSlugs.length;
+}
+
 export function createIncident(input: IncidentCreate, by: string): Incident {
-  const s = store();
-  const now = liveNow();
-  const id = `INC-${String(s.nextIncident++).padStart(4, "0")}`;
-  const alertIds = input.alertIds ?? [];
-  const incident: IncidentRecord = {
-    id,
+  const now = nowIso();
+  const incident = insertIncident({
     title: input.title,
     severity: input.severity,
     status: "open",
@@ -80,20 +164,13 @@ export function createIncident(input: IncidentCreate, by: string): Incident {
     rootCause: "",
     fix: "",
     followUps: [],
-    alertIds,
-  };
-  for (const alertId of alertIds) {
-    const alert = s.alerts.find((a) => a.id === alertId)!;
-    alert.incidentId = id;
-    incident.timeline.push({ at: now, kind: "alert", text: `Linked alert: ${alert.title}`, evidence: [{ kind: "alert", id: alert.id, label: alert.id }] });
-    for (const ev of alert.evidence) {
-      if (ev.kind === "trace" && !incident.affectedSlugs.includes(ev.id)) incident.affectedSlugs.push(ev.id);
-    }
-  }
-  s.incidents.push(incident);
-  const ev = [{ kind: "incident" as const, id, label: id }];
-  recordAction({ at: now, user: by, kind: "incident_opened", text: `Opened ${id}: ${incident.title}`, evidence: ev });
-  addNotification({ at: now, kind: "incident_opened", severity: incident.severity, title: `${id} opened: ${incident.title}`, body: `Opened by ${by}`, evidence: ev });
+    alertIds: [],
+  });
+  for (const alertId of input.alertIds ?? []) linkAlert(incident, alertId, now);
+  saveIncident(incident);
+  const ev: Evidence[] = [{ kind: "incident", id: incident.id, label: incident.id }];
+  recordAction({ at: now, user: by, kind: "incident_opened", text: `Opened ${incident.id}: ${incident.title}`, evidence: ev });
+  addNotification({ at: now, kind: "incident_opened", severity: incident.severity, title: `${incident.id} opened: ${incident.title}`, body: `Opened by ${by}`, evidence: ev });
   return withDraft(incident, now);
 }
 
@@ -119,11 +196,11 @@ export function parseIncidentPatch(body: unknown): IncidentPatch {
 
 export function patchIncident(id: string, patch: IncidentPatch, by: string): Incident {
   const i = record(id);
-  const now = liveNow();
+  const now = nowIso();
   if (patch.status && patch.status !== i.status) {
     i.timeline.push({ at: now, kind: "status", text: `Status changed from ${i.status} to ${patch.status} by ${by}` });
     if (patch.status === "resolved") {
-      const ev = [{ kind: "incident" as const, id: i.id, label: i.id }];
+      const ev: Evidence[] = [{ kind: "incident", id: i.id, label: i.id }];
       recordAction({ at: now, user: by, kind: "incident_resolved", text: `Resolved ${i.id}: ${i.title}`, evidence: ev });
       addNotification({ at: now, kind: "incident_resolved", severity: "info", title: `${i.id} resolved`, body: [`By ${by}.`, patch.fix ?? i.fix].filter(Boolean).join(" "), evidence: ev });
     }
@@ -137,7 +214,13 @@ export function patchIncident(id: string, patch: IncidentPatch, by: string): Inc
     i.timeline.push({ at: now, kind: "note", text: `${by}: ${patch.note}` });
     recordAction({ at: now, user: by, kind: "incident_note", text: `Note on ${i.id}: ${patch.note}`, evidence: [{ kind: "incident", id: i.id, label: i.id }] });
   }
+  saveIncident(i);
   return withDraft(i, now);
+}
+
+/** Unresolved alerts linked to an incident. */
+export function openAlertsOf(i: IncidentRecord) {
+  return activeAlertRecords().filter((a) => a.incidentId === i.id);
 }
 
 // Text from people (titles, notes, causes) must not turn into headings, links or raw HTML in the report.
@@ -161,7 +244,7 @@ function block(s: string): string {
 // A clean report someone can paste into an email or the wiki.
 export function incidentMarkdown(id: string): { filename: string; body: string } {
   const i = getIncident(id);
-  const name = (sys: string) => SYSTEM_BY_ID.get(sys as never)?.name ?? sys;
+  const name = (sys: string) => systemName(sys);
   const lines = [
     `# ${i.id}: ${inline(i.title)}`,
     "",

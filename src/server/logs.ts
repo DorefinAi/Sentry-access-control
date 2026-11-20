@@ -1,13 +1,15 @@
-// Log lines for the Logs page, the system pages and the summaries.
-// Live (a backend is configured): lines pulled into sentry.local.db by logSync.ts, real time.
-// Demo (no backend configured): the Phase 1 data in src/data/logs.ts on the frozen clock.
-import type { LogEntry, LogLevel, LogPage, LogQuery, LogRange, SystemId } from "@/types/control";
-import { LOGS } from "@/data/logs";
+// Log lines for the Logs page, the system pages, the summaries and the detection rules: the lines
+// pulled into sentry.local.db by logSync.ts. HTTP request lines ("incoming request" / "request
+// completed", most of what Socia writes) are left out unless noise is asked for.
+import type { LogEntry, LogErrorGroup, LogLevel, LogPage, LogQuery, LogRange, SystemId } from "@/types/control";
 import { db } from "./db";
 import { badRequest, notFound } from "./http";
 import { logsLive, sourceStatus } from "./logSync";
-import { liveNow } from "./store";
+import { nowMs } from "./time";
 import { intParam, isoParam, LOG_LEVELS, oneOf, systemList } from "./validate";
+
+/** Request lines hidden by default (Fastify / pino access logs). */
+export const NOISE_MESSAGES = ["incoming request", "request completed"];
 
 export interface LogFilter {
   system?: SystemId[];
@@ -16,13 +18,12 @@ export interface LogFilter {
   fromMs?: number;
   toMs?: number;
   slug?: string;
+  noise?: boolean; // true: keep the request lines
 }
 
 const RANGES: LogRange[] = ["15m", "1h", "6h", "24h", "today", "all"];
 const IST_OFFSET_MS = 5.5 * 3600e3;
 
-/** "Now" for time presets: the real clock for live logs, the demo clock for demo data. */
-const clockMs = () => (logsLive() ? Date.now() : Date.parse(liveNow()));
 
 export function rangeStart(range: LogRange, now: number): number | undefined {
   const back: Partial<Record<LogRange, number>> = { "15m": 15 * 60e3, "1h": 3600e3, "6h": 6 * 3600e3, "24h": 24 * 3600e3 };
@@ -47,7 +48,7 @@ export function parseLogQuery(params: URLSearchParams): LogQuery & { fromMs?: nu
   let fromMs = isoParam(params.get("from"), "from");
   const toMs = isoParam(params.get("to"), "to", "end");
   const range = params.get("range") ? oneOf(params.get("range"), RANGES, "range") : undefined;
-  if (range && fromMs === undefined && toMs === undefined) fromMs = rangeStart(range, clockMs());
+  if (range && fromMs === undefined && toMs === undefined) fromMs = rangeStart(range, nowMs());
   if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) throw badRequest("from must be before to.");
   const q = params.get("q")?.trim() || undefined;
   if (q && q.length > 200) throw badRequest("q is too long (max 200 characters).");
@@ -55,7 +56,10 @@ export function parseLogQuery(params: URLSearchParams): LogQuery & { fromMs?: nu
   const cursor = params.get("cursor") || undefined;
   if (cursor && !/^\d+(?:_\d+)?$/.test(cursor)) throw badRequest("cursor is not valid. Use the nextCursor from the last page.");
   const limit = intParam(params.get("limit"), "limit", 1, 500, 100);
+  const rawNoise = params.get("noise");
+  if (rawNoise !== null && !["0", "1", "true", "false"].includes(rawNoise)) throw badRequest("noise must be 1 or 0.");
   return {
+    noise: rawNoise === "1" || rawNoise === "true",
     system,
     level,
     q,
@@ -140,6 +144,10 @@ function where(f: LogFilter): { sql: string; params: unknown[] } {
     parts.push("at_ms <= ?");
     params.push(f.toMs);
   }
+  if (!f.noise) {
+    parts.push(`message NOT IN (${NOISE_MESSAGES.map(() => "?").join(", ")})`);
+    params.push(...NOISE_MESSAGES);
+  }
   if (f.q) {
     // instr, not LIKE: the text is matched as typed, % and _ included
     parts.push("instr(lower(message || ' ' || coalesce(logger, '') || ' ' || coalesce(slug, '') || ' ' || coalesce(item_id, '') || ' ' || source || '-' || src_id), ?) > 0");
@@ -165,32 +173,100 @@ function queryLive(query: ReturnType<typeof parseLogQuery>): LogPage {
   const page = rows.slice(0, limit);
   const last = page[page.length - 1];
   return {
-    live: true,
+    live: logsLive(),
     sources: sourceStatus(),
     entries: page.map(toEntry),
     nextCursor: rows.length > limit && last ? `${last.at_ms}_${last.seq}` : null,
     total,
+    // Only on the first page: the counts describe the whole window, not one page
+    ...(query.cursor ? {} : { ...(query.noise ? {} : { noise: noiseStats(query) }), errorGroups: errorGroups(query) }),
   };
 }
 
-// ─── Demo: src/data/logs.ts ─────────────────────────────────────────────────
+/** The request lines this view leaves out, and their average rate over the window. */
+function noiseStats(f: LogFilter): { hidden: number; perMinute: number } {
+  const w = where({ ...f, noise: true });
+  const sql = `${w.sql}${w.sql ? " AND" : "WHERE"} message IN (${NOISE_MESSAGES.map(() => "?").join(", ")})`;
+  const row = db().prepare(`SELECT count(*) AS n, min(at_ms) AS first FROM logs ${sql}`).get(...w.params, ...NOISE_MESSAGES) as { n: number; first: number | null };
+  const hidden = Number(row.n);
+  const to = Math.min(f.toMs ?? nowMs(), nowMs());
+  const from = f.fromMs ?? row.first ?? to;
+  const minutes = Math.max(1, (to - from) / 60_000);
+  return { hidden, perMinute: hidden ? Math.round((hidden / minutes) * 10) / 10 : 0 };
+}
 
-function filterDemo(f: LogFilter): LogEntry[] {
+/** The most common error messages under the same filters (error level only), most frequent first. */
+export function errorGroups(f: LogFilter, limit = 10): LogErrorGroup[] {
   const levels = levelsFor(f.level);
-  const q = f.q?.toLowerCase();
-  return LOGS.filter((l) => {
-    if (f.system && !f.system.includes(l.system)) return false;
-    if (levels && !levels.includes(l.level)) return false;
-    if (f.slug && l.slug !== f.slug) return false;
-    const t = Date.parse(l.at);
-    if (f.fromMs !== undefined && t < f.fromMs) return false;
-    if (f.toMs !== undefined && t > f.toMs) return false;
-    if (q) {
-      const hay = `${l.message} ${l.logger ?? ""} ${l.slug ?? ""} ${l.itemId ?? ""} ${l.id}`.toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
+  if (levels && !levels.includes("error")) return [];
+  const w = where({ ...f, level: undefined });
+  const sql = `${w.sql}${w.sql ? " AND" : "WHERE"} level = 'error'`;
+  const rows = db()
+    .prepare(`SELECT system, message, count(*) AS n, min(at_ms) AS first_ms, max(at_ms) AS last_ms FROM logs ${sql} GROUP BY system, message ORDER BY n DESC, last_ms DESC LIMIT ?`)
+    .all(...w.params, limit) as { system: string; message: string; n: number; first_ms: number; last_ms: number }[];
+  const first = db().prepare(`SELECT source, src_id FROM logs ${sql} AND system = ? AND message = ? ORDER BY at_ms ASC, seq ASC LIMIT 1`);
+  return rows.map((r) => {
+    const f1 = first.get(...w.params, r.system, r.message) as { source: string; src_id: string };
+    return {
+      message: r.message,
+      system: r.system as SystemId,
+      count: Number(r.n),
+      firstSeen: new Date(r.first_ms).toISOString(),
+      lastSeen: new Date(r.last_ms).toISOString(),
+      firstId: `${f1.source}-${f1.src_id}`,
+    };
   });
+}
+
+// ─── For the detection rules, telemetry and traces ──────────────────────────
+
+/** Error lines per system in [fromMs, toMs). */
+export function errorCounts(fromMs: number, toMs: number): { system: string; n: number }[] {
+  return (db().prepare("SELECT system, count(*) AS n FROM logs WHERE level = 'error' AND at_ms >= ? AND at_ms < ? GROUP BY system").all(fromMs, toMs) as { system: string; n: number }[]).map((r) => ({
+    system: r.system,
+    n: Number(r.n),
+  }));
+}
+
+/** Error messages seen at least `min` times in [fromMs, toMs), per system, most frequent first. */
+export function repeatedErrors(fromMs: number, toMs: number, min: number, limit?: number): { system: string; key: string; message: string; n: number; firstId: string; lastAt: string }[] {
+  // Lines built from a template (contract v1.1: fields.tmpl) group on logger + template, so
+  // "job 41 failed" and "job 42 failed" are the same error; other lines group on the message.
+  const rows = db()
+    .prepare(
+      `WITH e AS (
+         SELECT system, message, at_ms, seq, source, src_id,
+                CASE WHEN json_valid(fields) AND json_type(fields, '$.tmpl') = 'text'
+                     THEN 'tmpl:' || coalesce(logger, '') || '|' || json_extract(fields, '$.tmpl')
+                     ELSE 'msg:' || message END AS gkey,
+                CASE WHEN json_valid(fields) AND json_type(fields, '$.tmpl') = 'text' THEN json_extract(fields, '$.tmpl') ELSE message END AS label
+           FROM logs WHERE level = 'error' AND at_ms >= ? AND at_ms < ?)
+       SELECT system, gkey, min(label) AS label, count(*) AS n, max(at_ms) AS last_ms,
+              (SELECT source || '-' || src_id FROM e AS f WHERE f.system = e.system AND f.gkey = e.gkey ORDER BY at_ms, seq LIMIT 1) AS first_id
+         FROM e GROUP BY system, gkey HAVING count(*) >= ? ORDER BY n DESC${limit ? " LIMIT ?" : ""}`,
+    )
+    .all(fromMs, toMs, min, ...(limit ? [limit] : [])) as { system: string; gkey: string; label: string; n: number; last_ms: number; first_id: string }[];
+  return rows.map((r) => ({ system: r.system, key: r.gkey, message: r.label, n: Number(r.n), firstId: r.first_id, lastAt: new Date(r.last_ms).toISOString() }));
+}
+
+/** Error lines per bucket of bucketMs, from fromMs up to toMs (telemetry). */
+export function errorsPerBucket(fromMs: number, toMs: number, bucketMs: number): number[] {
+  const n = Math.max(0, Math.ceil((toMs - fromMs) / bucketMs));
+  const out = Array<number>(n).fill(0);
+  const rows = db()
+    .prepare("SELECT (at_ms - ?) / ? AS b, count(*) AS n FROM logs WHERE level = 'error' AND at_ms >= ? AND at_ms < ? GROUP BY b")
+    .all(fromMs, bucketMs, fromMs, toMs) as { b: number; n: number }[];
+  for (const r of rows) {
+    const b = Math.floor(Number(r.b));
+    if (b >= 0 && b < n) out[b] = Number(r.n);
+  }
+  return out;
+}
+
+/** One story's log lines (trace evidence), oldest first. */
+export function logsForSlug(slug: string, limit = 200): LogEntry[] {
+  const rows = db().prepare(`SELECT ${COLUMNS} FROM logs WHERE slug = ? ORDER BY at_ms ASC, seq ASC LIMIT ?`).all(slug, limit) as unknown as DbRow[];
+  return rows.map(toEntry);
 }
 
 // ─── Shared ─────────────────────────────────────────────────────────────────
@@ -206,27 +282,6 @@ export interface LogStats {
 
 export function logStats(f: LogFilter): LogStats {
   const byLevel: Record<LogLevel, number> = { error: 0, warn: 0, info: 0, debug: 0 };
-  if (!logsLive()) {
-    const entries = filterDemo(f); // oldest first
-    const bySystem = new Map<SystemId, number>();
-    const errors = new Map<string, { count: number; firstId: string; order: number }>();
-    entries.forEach((e, i) => {
-      byLevel[e.level]++;
-      bySystem.set(e.system, (bySystem.get(e.system) ?? 0) + 1);
-      if (e.level === "error") {
-        const m = errors.get(e.message);
-        if (m) m.count++;
-        else errors.set(e.message, { count: 1, firstId: e.id, order: i });
-      }
-    });
-    const top = [...errors.entries()].sort((a, b) => b[1].count - a[1].count || a[1].order - b[1].order)[0];
-    return {
-      total: entries.length,
-      byLevel,
-      bySystem: [...bySystem.entries()].sort((a, b) => b[1] - a[1]),
-      topError: top ? { message: top[0], count: top[1].count, firstId: top[1].firstId } : null,
-    };
-  }
   const w = where(f);
   const d = db();
   for (const r of d.prepare(`SELECT level, count(*) AS n FROM logs ${w.sql} GROUP BY level`).all(...w.params) as { level: string; n: number }[]) {
@@ -252,31 +307,21 @@ export function logStats(f: LogFilter): LogStats {
 }
 
 export function queryLogs(query: ReturnType<typeof parseLogQuery>): LogPage {
-  if (logsLive()) return queryLive(query);
-  if (query.cursor && !/^\d+$/.test(query.cursor)) throw badRequest("cursor is not valid. Use the nextCursor from the last page.");
-  const matching = filterDemo(query).reverse(); // newest first
-  const offset = query.cursor ? Number(query.cursor) : 0;
-  const limit = query.limit ?? 100;
-  const entries = matching.slice(offset, offset + limit);
-  const next = offset + limit;
-  return { live: false, sources: [], entries, nextCursor: next < matching.length ? String(next) : null, total: matching.length };
+  return queryLive(query);
 }
 
 /** The newest `limit` lines of one system, newest first. */
 export function recentLogs(system: SystemId, limit = 50): LogEntry[] {
-  if (!logsLive()) return LOGS.filter((l) => l.system === system).slice(-limit).reverse();
-  const rows = db().prepare(`SELECT ${COLUMNS} FROM logs WHERE system = ? ORDER BY at_ms DESC, seq DESC LIMIT ?`).all(system, limit) as DbRow[];
+  const noise = NOISE_MESSAGES.map(() => "?").join(", ");
+  const rows = db()
+    .prepare(`SELECT ${COLUMNS} FROM logs WHERE system = ? AND message NOT IN (${noise}) ORDER BY at_ms DESC, seq DESC LIMIT ?`)
+    .all(system, ...NOISE_MESSAGES, limit) as unknown as DbRow[];
   return rows.map(toEntry);
 }
 
 export function getLog(id: string): LogEntry {
-  if (logsLive()) {
-    const m = /^(samvadia|socia)-(\d{1,19})$/.exec(id);
-    const row = m ? (db().prepare(`SELECT ${COLUMNS} FROM logs WHERE source = ? AND src_id = ?`).get(m[1], m[2]) as DbRow | undefined) : undefined;
-    if (!row) throw notFound(`No log line with id ${id}.`);
-    return toEntry(row);
-  }
-  const entry = LOGS.find((l) => l.id === id);
-  if (!entry) throw notFound(`No log line with id ${id}.`);
-  return entry;
+  const m = /^(samvadia|socia)-(\d{1,19})$/.exec(id);
+  const row = m ? (db().prepare(`SELECT ${COLUMNS} FROM logs WHERE source = ? AND src_id = ?`).get(m[1], m[2]) as DbRow | undefined) : undefined;
+  if (!row) throw notFound(`No log line with id ${id}.`);
+  return toEntry(row);
 }

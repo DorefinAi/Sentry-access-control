@@ -16,7 +16,7 @@ const st = await load<typeof import("./store")>("./store.ts");
 const session = await load<typeof import("./session")>("./session.ts");
 const users = await load<typeof import("./users")>("./users.ts");
 const live = await load<typeof import("./liveSessions")>("./liveSessions.ts");
-const { TODAY } = await load<typeof import("../data/time")>("../data/time.ts");
+const time = await load<typeof import("./time")>("./time.ts");
 
 const PW = "correct horse battery";
 const g = globalThis as { __sentryStore?: unknown; __sentryAudit?: { broken: boolean; dirty: boolean } };
@@ -48,11 +48,11 @@ async function test(name: string, fn: () => Promise<void>) {
   console.log(`  ok  ${name}`);
 }
 
-await test("actions saved by an earlier run do not count as today's", async () => {
-  const earlier = new Date(Date.now() - 3600e3).toISOString();
+await test("actions saved on an earlier day do not count as today's", async () => {
+  const yesterday = time.ist(Date.now() - 86_400_000);
   writeFileSync(
     st.AUDIT_FILE(),
-    JSON.stringify({ version: 1, actionLog: [{ at: `${TODAY}T16:31:00+05:30`, user: "ada", kind: "ack", text: "Acked ALR-1 last run", realAt: earlier }], loginLog: [] }),
+    JSON.stringify({ version: 1, actionLog: [{ at: yesterday, user: "ada", kind: "ack", text: "Acked ALR-1 yesterday", realAt: yesterday }], loginLog: [] }),
   );
   restart();
   st.store();

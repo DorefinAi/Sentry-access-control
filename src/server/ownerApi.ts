@@ -87,11 +87,15 @@ export function readBackendError(body: unknown): { code: string; message: string
 
 // Plain-words messages for the codes both backends send: unauthorized, rate_limited, invalid_actor,
 // last_admin, self (Socia delete), unknown_role, unknown_permission, duplicate_permission, not_found, invalid.
-function backendError(system: PeopleSystem, status: number, body: unknown): HttpError {
+function backendError(system: PeopleSystem, status: number, body: unknown, what?: string): HttpError {
   const label = SYSTEM_LABEL[system];
   const { code, message: theirs } = readBackendError(body);
-  if (status === 401) return new NotConnected("refused", 502, `${label} refused Sentry's owner key. Check ${ENV[system].key} matches OWNER_API_KEY there.`);
+  if (status === 401) return Object.assign(new NotConnected("refused", 502, `${label} refused Sentry's owner key. Check ${ENV[system].key} matches OWNER_API_KEY there.`), { upstream: 401 });
   if (status === 429) return new HttpError(429, "rate_limited", `${label} is refusing owner calls for a while after too many failed key checks. Try again in about 10 minutes.`);
+  if (status === 404 && code !== "not_found" && what) {
+    // A read the backend does not serve (yet): say which one, not "owner API off"
+    return new NotConnected("refused", 502, `${label} does not serve ${what} yet (404). Update that backend.`);
+  }
   if (status === 404 && code !== "not_found") {
     // The route itself is missing: the owner API is off (OWNER_API_KEY unset or short there)
     return new NotConnected("refused", 502, `${label} has its owner API switched off. Set OWNER_API_KEY (32+ characters) on that backend.`);
@@ -125,9 +129,16 @@ const NEVER_SENT = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNRE
 
 /**
  * Calls `/owner/<path>` on one backend as `actor` (the owner's Sentry username).
- * `fetchImpl` is for tests; normally the global fetch.
+ * `fetchImpl` is for tests; normally the global fetch. `what` names a read ("GET /owner/ops/summary")
+ * so a 404 for a route the backend does not have yet says so.
  */
-export async function ownerFetch(system: PeopleSystem, path: string, actor: string, init: { method?: string; body?: unknown } = {}, fetchImpl: typeof fetch = globalThis.fetch): Promise<unknown> {
+export async function ownerFetch(
+  system: PeopleSystem,
+  path: string,
+  actor: string,
+  init: { method?: string; body?: unknown; what?: string } = {},
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<unknown> {
   const config = ownerConfig(system);
   if (config instanceof NotConnected) throw config;
   if (!ACTOR_RE.test(actor)) throw new HttpError(400, "invalid_actor", "Your Sentry username cannot be sent as the person making the change.");
@@ -169,7 +180,11 @@ export async function ownerFetch(system: PeopleSystem, path: string, actor: stri
   }
   if (!res.ok) {
     if (write && res.status >= 500) throw outcomeUnknown(system);
-    throw backendError(system, res.status, body);
+    const err = backendError(system, res.status, body, init.what);
+    // How long the backend asked us to wait (429 Retry-After, in seconds), for backoff.ts
+    const retryAfter = Number(res.headers.get("retry-after"));
+    if (Number.isFinite(retryAfter) && retryAfter > 0) Object.assign(err, { retryAfterSec: retryAfter });
+    throw err;
   }
   if (body === undefined) throw write ? outcomeUnknown(system) : new NotConnected("error", 502, `${label} sent an answer Sentry could not read.`);
   return body;

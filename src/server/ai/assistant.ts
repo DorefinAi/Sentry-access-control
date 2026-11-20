@@ -1,9 +1,7 @@
-// The "Ask" panel. Phase 1 matches the question to an intent and answers from the same server
-// functions the screens use. A QwenAssistant (Ollama tool calling) can implement the same interface later.
+// The "Ask" panel. It matches the question to an intent and answers from the same live server
+// functions the screens use (no AI yet). A QwenAssistant (Ollama tool calling) can implement the
+// same interface later.
 import type { ChatMessage, ChatRequest, ChatResponse, Evidence } from "@/types/control";
-import { dayStats, xCap } from "@/data/stats";
-import { SYSTEM_BY_ID } from "@/data/systems";
-import { hhmm, TODAY } from "@/data/time";
 import { listAlerts } from "../alerts";
 import { cleanEvidence } from "../evidence";
 import { listFixes } from "../fixes";
@@ -11,7 +9,8 @@ import { badRequest, HttpError } from "../http";
 import { getIncident, listIncidents } from "../incidents";
 import { loginReport } from "../logins";
 import { dailyReport } from "../reports";
-import { listSystems } from "../systems";
+import { liveMoment } from "../moment";
+import { hhmm, istDate, todayIst } from "../time";
 import { getTrace } from "../trace";
 import { isRecord, text } from "../validate";
 import { STATIC_MODEL } from "./summary";
@@ -78,7 +77,7 @@ function suggestionsExcept(...skip: string[]): string[] {
 
 function broke(): Answer {
   const live = listAlerts().filter((a) => a.state !== "resolved");
-  const incidents = listIncidents().filter((i) => i.openedAt.startsWith(TODAY));
+  const incidents = listIncidents().filter((i) => istDate(i.openedAt) === todayIst());
   const lines = live.length
     ? live.map((a) => `- **${a.severity}** ${a.title}${a.state === "acked" ? " (acked)" : ""}`)
     : ["- Nothing open right now."];
@@ -96,7 +95,7 @@ function broke(): Answer {
 }
 
 function daily(): Answer {
-  const r = dailyReport(TODAY);
+  const r = dailyReport(todayIst());
   return {
     text: `${r.narrative.text}\n\nThe full report is under Reports.`,
     evidence: r.narrative.evidence,
@@ -106,8 +105,8 @@ function daily(): Answer {
   };
 }
 
-function logins(): Answer {
-  const r = loginReport(TODAY);
+async function logins(): Promise<Answer> {
+  const r = await loginReport(todayIst());
   const shown = r.unusual.slice(0, 5);
   const unusual = shown.map((e) => `- ${hhmm(e.at)} **${e.user}** on ${e.app}: ${e.result.replace("_", " ")} (${e.flags.join(", ").replace(/_/g, " ")}) from ${e.ip}`);
   return {
@@ -133,22 +132,24 @@ function fix(): Answer {
   };
 }
 
-function trace(slug?: string): Answer {
-  const example = "271026_JPR_RAIN_AV_POOJA";
+async function trace(slug?: string): Promise<Answer> {
   if (!slug) {
     return {
-      text: `Which story? Give me the slug, for example \`${example}\`.`,
+      text: "Which story? Give me its slug (the story's folder name, like DDMMYY_CITY_SUBJECT), or search on the Trace screen.",
       evidence: [],
-      suggestions: [`Where is slug ${example}?`, "Where is slug 271026_AJM_ROZGAR_MELA_PKG_RAMESH?", SUGGEST.broke],
-      facts: { quotable: [example] },
+      suggestions: [SUGGEST.broke, SUGGEST.fix, SUGGEST.daily],
+      facts: {},
     };
   }
   let t;
   try {
-    t = getTrace(slug);
+    t = await getTrace(slug);
   } catch (err) {
     if (err instanceof HttpError && err.status === 404) {
       return { text: `I cannot find a story with slug \`${slug}\`. Try the search on the Trace screen.`, evidence: [], suggestions: suggestionsExcept(), facts: { quotable: [slug] } };
+    }
+    if (err instanceof HttpError && err.status === 503) {
+      return { text: err.message, evidence: [], suggestions: suggestionsExcept(), facts: { quotable: [err.message] } };
     }
     throw err;
   }
@@ -170,69 +171,67 @@ function trace(slug?: string): Answer {
   };
 }
 
-// Built from what is live now: unresolved octopus-silent alerts, the system's health, and the
-// latest incident that involved Octopus (found by query, not by id).
+/** A Samvadia or Socia check as one plain line ("FTP: OK", "FTP failing: ..."), or why it is not known. */
+function checkLine(source: "samvadia" | "socia", id: string): { text: string; ok: boolean | null } {
+  const m = liveMoment();
+  const summary = m.ops[source].summary;
+  if (!summary) return { text: m.ops[source].problem ?? "No data.", ok: null };
+  const c = summary.checks.find((x) => x.id === id);
+  if (!c) return { text: `${source === "samvadia" ? "Samvadia" : "Socia"} does not report a ${id} check.`, ok: null };
+  if (c.ok === null) return { text: `${c.label}: not checked yet.`, ok: null };
+  const last = c.lastOkAt ? ` Last OK at ${hhmm(c.lastOkAt)}.` : "";
+  return c.ok ? { text: `${c.label}: OK.${c.detail ? ` ${c.detail}.` : ""}${last}`, ok: true } : { text: `${c.label} failing${c.lastError ? `: ${c.lastError}` : ""}.${last}`, ok: false };
+}
+
 function octopus(): Answer {
-  const sys = listSystems().find((s) => s.id === "octopus")!;
-  const silent = listAlerts().filter((a) => a.ruleId === "octopus-silent" && a.state !== "resolved");
+  const m = liveMoment();
+  const line = checkLine("samvadia", "octopus");
+  const alerts = listAlerts().filter((a) => a.state !== "resolved" && a.systems.includes("octopus"));
   const latest = listIncidents().find((i) => i.systems.includes("octopus"));
   const inc = latest ? getIncident(latest.id) : null;
-  const s = dayStats();
-
-  const head = silent.length
-    ? `**Octopus is not polling.** ${silent.map((a) => `${a.title} (since ${hhmm(a.firedAt)})`).join("; ")}.`
-    : sys.health === "ok"
-      ? `**Octopus is polling.** ${sys.summary}.`
-      : `**Octopus needs a look (${sys.health}).** ${sys.summary}.`;
-  const lines = [head, `It has collected ${s.collected} stories today.`];
-  if (inc) {
-    lines.push(`${inc.status === "resolved" ? "Earlier" : "Open now"}: ${inc.id} (${inc.status}), ${inc.impact.summary}.${inc.rootCause ? ` Cause: ${inc.rootCause}` : ""}`);
-    lines.push(...inc.followUps.filter((f) => !f.done).map((f) => `- Open follow-up: ${f.text}`));
-  }
+  const collected = m.ops.samvadia.summary?.flow.collected ?? null;
+  const lines = [`**${line.ok === false ? "Octopus needs a look." : line.ok ? "Octopus is fetching the feed." : "Octopus status is not known."}** ${line.text}`];
+  if (collected !== null) lines.push(`It has collected ${collected} stories today.`);
+  if (alerts.length) lines.push(...alerts.map((a) => `- Open: ${a.title} (since ${hhmm(a.firedAt)})`));
+  if (inc) lines.push(`${inc.status === "resolved" ? "Earlier" : "Open now"}: ${inc.id} (${inc.status}), ${inc.impact.summary}.`);
   return {
     text: lines.join("\n"),
-    evidence: [
-      { kind: "system", id: "octopus", label: "Octopus" },
-      ...silent.map((a) => ({ kind: "alert" as const, id: a.id, label: a.title })),
-      ...(inc ? [{ kind: "incident" as const, id: inc.id, label: inc.id }] : []),
-    ],
+    evidence: [{ kind: "system", id: "octopus", label: "Octopus" }, ...alerts.map((a) => ({ kind: "alert" as const, id: a.id, label: a.title })), ...(inc ? [{ kind: "incident" as const, id: inc.id, label: inc.id }] : [])],
     suggestions: suggestionsExcept(SUGGEST.octopus),
-    facts: {
-      values: { collected: s.collected },
-      quotable: [
-        sys.summary,
-        ...silent.flatMap((a) => [a.title, hhmm(a.firedAt)]),
-        ...(inc ? [inc.id, inc.impact.summary, inc.rootCause, ...inc.followUps.map((f) => f.text)] : []),
-      ],
-    },
+    facts: { values: { collected }, quotable: [line.text, ...alerts.flatMap((a) => [a.title, hhmm(a.firedAt)]), ...(inc ? [inc.id, inc.impact.summary] : [])] },
   };
 }
 
 function ftp(): Answer {
-  const alert = listAlerts().find((a) => a.ruleId === "ftp-upload-failed" && a.state !== "resolved");
-  const sys = SYSTEM_BY_ID.get("ftp")!;
+  const line = checkLine("samvadia", "ftp");
+  const alert = listAlerts().find((a) => a.state !== "resolved" && a.systems.includes("ftp"));
   if (!alert) {
-    return { text: `**FTP is fine.** ${sys.summary}.`, evidence: [{ kind: "system", id: "ftp", label: "FTP" }], suggestions: suggestionsExcept(SUGGEST.ftp), facts: { quotable: [sys.summary] } };
+    return { text: `**${line.ok === false ? "FTP needs a look." : line.ok ? "FTP is fine." : "FTP status is not known."}** ${line.text}`, evidence: [{ kind: "system", id: "ftp", label: "FTP" }], suggestions: suggestionsExcept(SUGGEST.ftp), facts: { quotable: [line.text] } };
   }
   return {
     text: [`**${alert.title}.**`, alert.runbook.meaning, "", "Fix:", ...alert.runbook.fix.map((f) => `- ${f}`)].join("\n"),
-    evidence: alert.evidence,
-    suggestions: [SUGGEST.fix, "Where is slug 271026_AJM_ROZGAR_MELA_PKG_RAMESH?", SUGGEST.broke],
+    evidence: [{ kind: "alert", id: alert.id, label: alert.id }, ...alert.evidence],
+    suggestions: [SUGGEST.fix, SUGGEST.broke, SUGGEST.daily],
     facts: { quotable: [alert.title, alert.runbook.meaning, ...alert.runbook.fix] },
   };
 }
 
 function x(): Answer {
-  const cap = xCap();
-  const s = dayStats();
+  const m = liveMoment();
+  const s = m.ops.socia.summary;
+  if (!s) return { text: `**X: no numbers.** ${m.ops.socia.problem ?? "Socia is not connected."}`, evidence: [{ kind: "system", id: "x", label: "X" }], suggestions: suggestionsExcept(SUGGEST.x), facts: { quotable: [m.ops.socia.problem] } };
+  const operator = s.stages.find((st) => st.id === "operator");
+  const render = s.stages.find((st) => st.id === "render");
   return {
     text: [
-      `**${s.xPosts} posts on X today** (fake mode), ${s.xRecalled} recalled.`,
-      `Daily cap: ${cap.used} of ${cap.limit} writes used (${cap.pct}%). ${s.waitingOperator} drafts wait for an operator and ${s.renderFailed} card failed to render.`,
-    ].join("\n"),
+      `**${s.flow.posts} posts marked on X today**, ${s.flow.recalled} recalled${s.phase === 1 ? " (phase 1: operators post by hand)" : ""}.`,
+      `${operator ? `${operator.waiting} drafts wait for an operator. ` : ""}${render ? `${render.failed} cards failed to render today.` : ""}`.trim(),
+    ]
+      .filter(Boolean)
+      .join("\n"),
     evidence: [{ kind: "system", id: "x", label: "X" }, { kind: "system", id: "socia-publish", label: "Socia publish" }],
     suggestions: suggestionsExcept(SUGGEST.x),
-    facts: { values: { cap, xPosts: s.xPosts, xRecalled: s.xRecalled, waitingOperator: s.waitingOperator, renderFailed: s.renderFailed } },
+    facts: { values: { flow: s.flow, phase: s.phase, waiting: operator?.waiting, failed: render?.failed } },
   };
 }
 
@@ -291,11 +290,11 @@ export class StaticAssistant implements Assistant {
     const question = req.messages.at(-1)!.text;
     const { intent, slug } = detectIntent(question, req.context?.slug);
     const answer: Answer =
-      intent === "trace" ? trace(slug)
+      intent === "trace" ? await trace(slug)
       : intent === "octopus" ? octopus()
       : intent === "ftp" ? ftp()
       : intent === "x" ? x()
-      : intent === "logins" ? logins()
+      : intent === "logins" ? await logins()
       : intent === "fix" ? fix()
       : intent === "broke" ? broke()
       : intent === "daily" ? daily()

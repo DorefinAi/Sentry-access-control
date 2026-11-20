@@ -130,11 +130,41 @@ await test("old lines are pruned after 30 days", () => {
   assert.equal(q("").total, 0);
 });
 
-await test("with no backend configured the demo data is served", () => {
+await test("request lines are hidden unless asked for, with a per-minute count", async () => {
+  const { transaction } = await load<typeof import("./db")>("./db.ts");
+  const base = Date.now() - 10 * 60_000;
+  transaction((d) => {
+    const ins = d.prepare("INSERT INTO logs (source, src_id, at_ms, at, system, level, logger, message, slug, item_id, fields) VALUES ('socia', ?, ?, ?, 'socia-api', ?, NULL, ?, NULL, NULL, NULL)");
+    for (let i = 0; i < 20; i++) ins.run(String(100 + i), base + i * 30_000, new Date(base + i * 30_000).toISOString(), "info", i % 2 ? "incoming request" : "request completed");
+    for (let i = 0; i < 3; i++) ins.run(String(200 + i), base + i * 1000, new Date(base + i * 1000).toISOString(), "error", "render failed: text overflow");
+    ins.run("300", base + 5000, new Date(base + 5000).toISOString(), "error", "db timeout");
+  });
+  const hidden = q("range=1h");
+  assert.equal(hidden.total, 4, "only the 4 error lines");
+  assert.equal(hidden.noise?.hidden, 20);
+  assert.ok((hidden.noise?.perMinute ?? 0) > 0);
+  const shown = q("range=1h&noise=1");
+  assert.equal(shown.total, 24);
+  assert.equal(shown.noise, undefined);
+  assert.throws(() => q("noise=yes"), /noise/);
+});
+
+await test("repeated errors are grouped with count, first and last seen", () => {
+  const groups = q("range=1h").errorGroups!;
+  assert.equal(groups[0].message, "render failed: text overflow");
+  assert.equal(groups[0].count, 3);
+  assert.equal(groups[0].system, "socia-api");
+  assert.equal(groups[0].firstId, "socia-200");
+  assert.ok(Date.parse(groups[0].firstSeen) < Date.parse(groups[0].lastSeen));
+  assert.equal(groups[1].count, 1);
+  assert.deepEqual(q("range=1h&level=warn&system=samvadia-api").errorGroups, []);
+});
+
+await test("with no backend configured there is no demo data: only what was stored", () => {
   delete process.env.SAMVADIA_API_URL;
   const page = q("range=all");
   assert.equal(page.live, false);
-  assert.ok(page.total > 0);
+  assert.equal(page.total, 4, "the stored lines, nothing made up");
 });
 
 await test("the action log and sign-in log survive a restart", async () => {

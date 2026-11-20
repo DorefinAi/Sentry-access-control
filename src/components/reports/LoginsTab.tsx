@@ -7,7 +7,7 @@ import { useApi } from "@/hooks/useApi";
 import { useClockReady } from "@/hooks/useNow";
 import { APP_LABELS, LOGIN_FLAG_LABELS, LOGIN_RESULT_LABELS } from "@/lib/labels";
 import { clockIst, exactIst, todayIst } from "@/lib/time";
-import type { AppName, LoginEvent, LoginReport } from "@/types/control";
+import type { AppName, LoginEvent, LoginReport, LoginSource } from "@/types/control";
 import { HealthLabel } from "@/components/common/Health";
 import { Raw, RelTime, Section, Stat } from "@/components/common/Bits";
 import { AsyncView, EmptyNote, LoadingRows } from "@/components/common/AsyncView";
@@ -73,9 +73,37 @@ function EventRows({ events, focus, flagsFirst }: { events: LoginEvent[]; focus?
   );
 }
 
-function Report({ r, focus }: { r: LoginReport; focus?: string | null }) {
+/** Where each backend's sign-ins came from: read now, the last answer (stale), or not readable at all. */
+function SourceNotes({ sources, filtered }: { sources: LoginSource[]; filtered: boolean }) {
+  const notes = sources.filter((s) => s.state !== "ok" || s.truncated);
+  if (!notes.length) return null;
+  return (
+    <Box component="ul" aria-label="Sign-in sources" sx={{ listStyle: "none", m: 0, p: 0, display: "grid", gap: 0.5 }}>
+      {notes.map((s) => (
+        <Typography component="li" key={s.source} variant="body2" color={s.state === "ok" ? "text.secondary" : "warning.main"}>
+          <strong>{s.label}</strong> ({s.apps.map((a) => APP_LABELS[a]).join(", ")}):{" "}
+          {s.state === "not_connected"
+            ? `not connected. ${s.message ?? ""}`
+            : s.state === "unreachable"
+              ? `not reachable, so its sign-ins are missing below. ${s.message ?? ""}`
+              : s.state === "stale"
+                ? <>showing its last answer, as of {s.asOf ? clockIst(s.asOf) : "?"} IST. {s.message ?? ""}</>
+                : null}
+          {s.truncated
+            ? filtered
+              ? " List cut: the backend sent only part of the day's events, and with an app filter the counts come from that partial list, so they may be low."
+              : " List cut: the backend sent only part of the day's events. The totals above are its exact counts; the per-app table and the list are not complete."
+            : ""}
+        </Typography>
+      ))}
+    </Box>
+  );
+}
+
+function Report({ r, focus, filtered }: { r: LoginReport; focus?: string | null; filtered: boolean }) {
   return (
     <Box sx={{ display: "grid", gap: 2 }}>
+      <SourceNotes sources={r.sources ?? []} filtered={filtered} />
       <Section title="Unusual sign-ins" id="unusual">
         {r.unusual.length ? <EventRows events={r.unusual} focus={focus} flagsFirst /> : <EmptyNote>Nothing unusual: no new IPs, off-hours sign-ins or repeated failures.</EmptyNote>}
       </Section>
@@ -120,9 +148,14 @@ function Report({ r, focus }: { r: LoginReport; focus?: string | null }) {
                   {s.user}
                 </Typography>
                 <Typography variant="body2">{APP_LABELS[s.app]}</Typography>
-                <Raw>{s.ip}</Raw>
+                {s.ip ? <Raw>{s.ip}</Raw> : null}
                 <Typography variant="caption" color="text.secondary">
-                  since <RelTime iso={s.since} />, last seen <RelTime iso={s.lastSeen} />
+                  since <RelTime iso={s.since} />
+                  {s.lastSeen ? (
+                    <>
+                      , last seen <RelTime iso={s.lastSeen} />
+                    </>
+                  ) : null}
                 </Typography>
               </Box>
             ))}
@@ -168,7 +201,7 @@ export function LoginsTab({ focus }: { focus?: string | null }) {
         </Typography>
       </Box>
       <AsyncView state={state} what="sign-ins" loading={<LoadingRows rows={4} height={64} />}>
-        {(r) => <Report r={r} focus={focus} />}
+        {(r) => <Report r={r} focus={focus} filtered={!!app} />}
       </AsyncView>
     </>
   );

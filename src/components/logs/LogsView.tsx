@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Box, Button, Checkbox, FormControl, InputAdornment, InputLabel, ListItemText, MenuItem, Select, TextField, Typography } from "@mui/material";
+import { Box, Button, Checkbox, FormControl, FormControlLabel, InputAdornment, InputLabel, ListItemText, MenuItem, Select, Switch, TextField, Typography } from "@mui/material";
 import { RefreshCw, Search, Sparkles, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getLogs, getSummary } from "@/lib/api";
@@ -10,7 +10,7 @@ import { useDebounced } from "@/hooks/useDebounced";
 import { useClockReady } from "@/hooks/useNow";
 import { LEVELS, LEVEL_LABELS, SYSTEM_IDS, SYSTEM_NAMES } from "@/lib/labels";
 import { RANGE_LABELS, RangePreset, exactIst, relative } from "@/lib/time";
-import type { AiSummary, LogEntry, LogLevel, LogPage, LogQuery, SystemId } from "@/types/control";
+import type { AiSummary, LogEntry, LogErrorGroup, LogLevel, LogPage, LogQuery, SystemId } from "@/types/control";
 import { PageHeader, cardSx } from "@/components/common/Bits";
 import { AsyncView, ErrorNote, LoadingRows } from "@/components/common/AsyncView";
 import { AiSummaryBox } from "@/components/common/AiSummaryBox";
@@ -27,6 +27,7 @@ interface Filters {
   range: RangePreset;
   q: string;
   slug: string;
+  noise: boolean; // show the HTTP request lines (hidden by default)
 }
 
 function readFilters(p: URLSearchParams): Filters {
@@ -41,6 +42,7 @@ function readFilters(p: URLSearchParams): Filters {
     range: RANGE_PRESETS.includes(range as RangePreset) ? (range as RangePreset) : DEFAULT_RANGE,
     q: p.get("q") ?? "",
     slug: p.get("slug") ?? "",
+    noise: p.get("noise") === "1",
   };
 }
 
@@ -51,12 +53,13 @@ function toSearch(f: Filters): string {
   if (f.range !== DEFAULT_RANGE) s.set("range", f.range);
   if (f.q) s.set("q", f.q);
   if (f.slug) s.set("slug", f.slug);
+  if (f.noise) s.set("noise", "1");
   return s.toString();
 }
 
 function toQuery(f: Filters): LogQuery {
-  // The server turns the range into times with its own clock (real for live logs, frozen for the demo)
-  return { system: f.systems, level: f.level ? [f.level] : undefined, q: f.q || undefined, slug: f.slug || undefined, range: f.range, limit: PAGE };
+  // The server turns the range into times with its own clock
+  return { system: f.systems, level: f.level ? [f.level] : undefined, q: f.q || undefined, slug: f.slug || undefined, range: f.range, limit: PAGE, noise: f.noise || undefined };
 }
 
 const LEVEL_OPTIONS: { value: LogLevel | ""; label: string }[] = [
@@ -99,9 +102,9 @@ function DebouncedField({ value, onCommit, label, placeholder, mono, icon }: { v
 
 const STALE_BEAT_MS = 90_000; // three missed 30 s heartbeats
 
-/** Where the lines come from: each backend's last pull and its processes' heartbeats, or "demo data". */
+/** Where the lines come from: each backend's last pull and its processes' heartbeats. */
 function SourceStrip({ page }: { page: LogPage }) {
-  // Heartbeats and pulls are real time, not the demo clock, so this ticks on its own
+  // Heartbeats and pulls are real time, so this ticks on its own
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 15_000);
@@ -110,7 +113,7 @@ function SourceStrip({ page }: { page: LogPage }) {
   if (!page.live) {
     return (
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-        Demo data. Set <code>SAMVADIA_API_URL</code> / <code>SAMVADIA_OWNER_KEY</code> or <code>SOCIA_API_URL</code> / <code>SOCIA_OWNER_KEY</code> in <code>.env.local</code> to see the real logs.
+        No backend is connected, so no new lines come in. Set <code>SAMVADIA_API_URL</code> / <code>SAMVADIA_OWNER_KEY</code> or <code>SOCIA_API_URL</code> / <code>SOCIA_OWNER_KEY</code> in <code>.env.local</code>.
       </Typography>
     );
   }
@@ -144,6 +147,41 @@ function SourceStrip({ page }: { page: LogPage }) {
           ) : null}
         </Box>
       ))}
+    </Box>
+  );
+}
+
+/** The most common error messages in this view: count, first and last seen, and a link to just those lines. */
+function ErrorGroups({ groups, onShow }: { groups: LogErrorGroup[]; onShow: (g: LogErrorGroup) => void }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
+  if (!groups.length) return null;
+  return (
+    <Box component="section" aria-label="Errors grouped by message" sx={{ ...cardSx, mb: 1.5, px: 1.5, py: 1 }}>
+      <Typography component="h2" variant="body2" sx={{ fontWeight: 700, mb: 0.5 }}>
+        Errors in this view, grouped
+      </Typography>
+      <Box component="ul" sx={{ listStyle: "none", m: 0, p: 0, display: "grid", gap: 0.5 }}>
+        {groups.map((g) => (
+          <Box component="li" key={`${g.system}:${g.message}`} sx={{ display: "flex", gap: 1, alignItems: "baseline", minWidth: 0, flexWrap: { xs: "wrap", sm: "nowrap" } }}>
+            <Typography variant="body2" sx={{ fontFamily: MONO_STACK, fontWeight: 700, color: "error.main", minWidth: 44, textAlign: "right" }}>
+              {g.count}×
+            </Typography>
+            <Typography variant="body2" title={g.message} sx={{ fontFamily: MONO_STACK, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {g.message}
+            </Typography>
+            <Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }} title={`First ${exactIst(g.firstSeen)}, last ${exactIst(g.lastSeen)}`}>
+              {SYSTEM_NAMES[g.system] ?? g.system} · first {relative(g.firstSeen, now)} · last {relative(g.lastSeen, now)}
+            </Typography>
+            <Button size="small" onClick={() => onShow(g)} sx={{ minHeight: 28, flexShrink: 0 }}>
+              Show
+            </Button>
+          </Box>
+        ))}
+      </Box>
     </Box>
   );
 }
@@ -280,12 +318,19 @@ export default function LogsView() {
       ) : null}
 
       {first.data ? <SourceStrip page={first.data} /> : null}
+      {first.data?.errorGroups ? <ErrorGroups groups={first.data.errorGroups} onShow={(g) => setFilters({ systems: [g.system], level: "error", q: g.message.slice(0, 200) })} /> : null}
 
       <Box sx={{ ...cardSx, overflow: "hidden" }}>
         <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.5, py: 1, flexWrap: "wrap" }}>
           <Typography variant="body2" color="text.secondary" sx={{ flex: 1 }} aria-live="polite">
             {first.data ? `Showing ${entries.length} of ${first.data.total} matching lines, newest first` : first.loading ? "Loading…" : ""}
+            {first.data?.noise?.hidden ? ` · ${first.data.noise.hidden} request lines hidden (about ${first.data.noise.perMinute} a minute)` : ""}
           </Typography>
+          <FormControlLabel
+            control={<Switch size="small" checked={filters.noise} onChange={(e) => setFilters({ noise: e.target.checked })} />}
+            label={<Typography variant="body2">Request lines</Typography>}
+            sx={{ mr: 0.5 }}
+          />
           {focus && first.data && !focusLoaded ? (
             <Typography variant="body2" color="text.secondary" sx={{ width: "100%", order: 2 }}>
               The linked line <code>{focus}</code> is not in this view. Try “Any time” or clear the filters.

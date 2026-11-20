@@ -1,123 +1,130 @@
-// The mission-control readouts: telemetry, gauges, uptime streaks. Each takes the moment it
-// describes, so the live board and a replay are built by the same code.
-import type { Gauge, Health, Outage, StackUptime, System, SystemId, TelemetryPoint, UptimeStreak } from "@/types/control";
-import { LOGS } from "@/data/logs";
-import { at as atTime, ms, TODAY } from "@/data/time";
-import { OUTAGES, STACK_OUTAGES, uptimePct } from "@/data/uptime";
-import { OCTOPUS_GAP, POLL_SECOND } from "@/data/world";
+// The mission-control readouts, all from stored history: telemetry from ops snapshots and the logs
+// table, streaks and uptime from health samples, gauges from the moment's ops summaries. Each takes
+// the moment it describes, so the live board and a replay are built by the same code.
+import type { Gauge, Health, StackUptime, System, TelemetryPoint, UptimeStreak } from "@/types/control";
+import { db } from "./db";
+import { errorsPerBucket } from "./logs";
 import type { Moment } from "./moment";
+import { streakAt, uptimePct } from "./probes/health";
 import { GAUGE_SPECS, thresholds, type GaugeId } from "./thresholds";
+import { dayStartMs, ist, istDate } from "./time";
 
 const MIN = 60_000;
-const DAY_MS = 86_400_000;
-const BUCKET_MIN = 10;
+const DAY = 86_400_000;
+const BUCKET_MS = 10 * MIN;
+const NEAR_MS = 2 * MIN; // a snapshot this close before a bucket edge stands for that edge
 
-const dayStart = () => ms(atTime("00:00", TODAY));
-
-function polledAt(minute: number): boolean {
-  const t = dayStart() + minute * MIN;
-  return t < ms(OCTOPUS_GAP.from) || t >= ms(OCTOPUS_GAP.resumedAt);
+interface SnapPoint {
+  atMs: number;
+  untilMs: number; // the same answer was seen until then
+  storiesIn: number | null;
+  octopusOkAt: string | null;
 }
 
-// Seconds since Octopus last polled (polls land at :28 past each minute).
-export function octopusLagSec(at: string): number {
-  const t = ms(at);
-  for (let m = Math.floor((t - dayStart()) / MIN); m >= 0; m--) {
-    const pollMs = dayStart() + m * MIN + POLL_SECOND * 1000;
-    if (pollMs <= t && polledAt(m)) return Math.round((t - pollMs) / 1000);
-  }
-  return Math.round((t - dayStart()) / 1000);
+/** Samvadia's snapshots of one day, reduced in SQL to the two numbers telemetry needs. */
+function samvadiaPoints(fromMs: number, toMs: number): SnapPoint[] {
+  const rows = db()
+    .prepare(
+      `SELECT at_ms, coalesce(until_ms, at_ms) AS until_ms,
+              json_extract(body, '$.flow.storiesIn') AS n,
+              (SELECT json_extract(value, '$.lastOkAt') FROM json_each(body, '$.checks') WHERE json_extract(value, '$.id') = 'octopus') AS oct
+         FROM ops_snapshots WHERE source = 'samvadia' AND ok = 1 AND coalesce(until_ms, at_ms) >= ? AND at_ms <= ? ORDER BY at_ms`,
+    )
+    .all(fromMs, toMs) as { at_ms: number; until_ms: number; n: number | null; oct: string | null }[];
+  return rows.map((r) => ({ atMs: r.at_ms, untilMs: r.until_ms, storiesIn: typeof r.n === "number" ? r.n : null, octopusOkAt: r.oct }));
 }
 
+/** Today's activity in 10-minute buckets up to the moment. */
 export function telemetry(m: Moment): TelemetryPoint[] {
-  const t = ms(m.at);
-  const points: TelemetryPoint[] = [];
-  for (let b = 0; dayStart() + b * BUCKET_MIN * MIN <= t; b++) {
-    const from = dayStart() + b * BUCKET_MIN * MIN;
-    const to = Math.min(from + BUCKET_MIN * MIN, t + 1);
-    const inBucket = (iso: string) => ms(iso) >= from && ms(iso) < to;
-    let polls = 0;
-    for (let k = 0; k < BUCKET_MIN; k++) {
-      const minute = b * BUCKET_MIN + k;
-      if (dayStart() + minute * MIN + POLL_SECOND * 1000 < to && polledAt(minute)) polls++;
+  const date = istDate(m.atMs);
+  const start = dayStartMs(date);
+  const end = m.atMs;
+  const points = samvadiaPoints(start, end);
+  const valueAt = (t: number): number | null => {
+    if (t <= start) return 0;
+    let best: SnapPoint | null = null;
+    for (const p of points) {
+      if (p.atMs > t) break;
+      best = p;
     }
-    points.push({
-      at: new Date(from + 5.5 * 3600_000).toISOString().slice(0, 19) + "+05:30",
-      storiesIn: m.stories.filter((s) => inBucket(s.receivedAt)).length,
-      errors: LOGS.filter((l) => l.level === "error" && inBucket(l.at)).length,
-      feedPolls: polls,
-    });
-  }
-  return points;
-}
+    return best && t - best.untilMs <= NEAR_MS ? best.storiesIn : null;
+  };
+  const buckets = Math.max(1, Math.ceil((end - start + 1) / BUCKET_MS));
+  const errors = errorsPerBucket(start, end + 1, BUCKET_MS);
+  const polls = new Set(points.map((p) => p.octopusOkAt).filter((x): x is string => !!x).map((x) => Date.parse(x)).filter((t) => t >= start && t <= end));
 
-// Where `at` falls in a list of outages: the current streak, or the outage still going on.
-function streakFrom(outages: Outage[], at: string): { upSince: string; streakSec: number; lastOutage: Outage | null } {
-  const t = ms(at);
-  const past = outages.filter((o) => ms(o.from) <= t).sort((a, b) => ms(a.from) - ms(b.from));
-  const last = past.at(-1);
-  if (!last) return { upSince: outages[0]?.from ?? at, streakSec: 0, lastOutage: null };
-  if (!last.to || ms(last.to) > t) {
-    return { upSince: at, streakSec: 0, lastOutage: { ...last, to: null } };
+  const stories: (number | null)[] = [];
+  for (let b = 0; b < buckets; b++) {
+    const v0 = valueAt(start + b * BUCKET_MS);
+    const v1 = valueAt(Math.min(start + (b + 1) * BUCKET_MS, end));
+    stories.push(v0 !== null && v1 !== null ? Math.max(0, v1 - v0) : null);
   }
-  return { upSince: last.to, streakSec: Math.round((t - ms(last.to)) / 1000), lastOutage: last };
-}
+  // Hours Sentry did not watch fully: the backend's hourly count, shown in the hour's first bucket
+  const hourly = m.ops.samvadia.summary && m.ops.samvadia.summary.date === date ? m.ops.samvadia.summary.hourly : null;
+  for (let h = 0; h < 24; h++) {
+    const idx = Array.from({ length: 6 }, (_, k) => h * 6 + k).filter((i) => i < buckets);
+    if (!idx.length || !idx.some((i) => stories[i] === null)) continue;
+    idx.forEach((i, k) => (stories[i] = k === 0 ? (hourly?.[h]?.storiesIn ?? 0) : 0));
+  }
 
-// Best streak between outages that had ended by `at`, or the current one if longer.
-function longestFrom(outages: Outage[], at: string, floorSec: number, current: number): number {
-  const t = ms(at);
-  const ended = outages.filter((o) => o.to && ms(o.to) <= t).sort((a, b) => ms(a.from) - ms(b.from));
-  let best = floorSec;
-  for (let i = 1; i < ended.length; i++) best = Math.max(best, Math.round((ms(ended[i].from) - ms(ended[i - 1].to!)) / 1000));
-  return Math.max(best, current);
+  return Array.from({ length: buckets }, (_, b) => {
+    const from = start + b * BUCKET_MS;
+    const to = from + BUCKET_MS;
+    let feedPolls = 0;
+    for (const t of polls) if (t >= from && t < to) feedPolls++;
+    return { at: ist(from), storiesIn: stories[b] ?? 0, errors: errors[b] ?? 0, feedPolls };
+  });
 }
 
 export function streaks(m: Moment, systems: System[]): UptimeStreak[] {
-  const t = ms(m.at);
   return systems
-    .map((sys): UptimeStreak => {
-      const o = OUTAGES[sys.id];
-      const cur = streakFrom(o.outages, m.at);
+    .map((sys): UptimeStreak | null => {
+      const s = streakAt(sys.id, m.atMs);
+      if (!s.known) return null; // never watched: no streak to show
       return {
         system: sys.id,
         name: sys.name,
         health: sys.health,
-        ...cur,
-        longestStreakSec: longestFrom(o.outages, m.at, o.longestSec, cur.streakSec),
-        uptimePct7d: uptimePct(o.outages.filter((x) => ms(x.from) <= t), t - 7 * DAY_MS, t),
+        upSince: s.upSince,
+        streakSec: s.streakSec,
+        longestStreakSec: s.longestStreakSec,
+        uptimePct7d: uptimePct(sys.id, m.atMs - 7 * DAY, m.atMs) ?? 0,
+        lastOutage: s.lastOutage,
       };
     })
+    .filter((x): x is UptimeStreak => x !== null)
     .sort((a, b) => b.streakSec - a.streakSec);
 }
 
 export function stackUptime(m: Moment): StackUptime {
-  const t = ms(m.at);
-  const known = STACK_OUTAGES.filter((o) => ms(o.from) <= t);
-  const cur = streakFrom(known, m.at);
+  const s = streakAt("stack", m.atMs);
   return {
-    ...cur,
-    longestStreakSec: longestFrom(known, m.at, 0, cur.streakSec),
-    uptimePct24h: uptimePct(known, t - DAY_MS, t),
-    uptimePct7d: uptimePct(known, t - 7 * DAY_MS, t),
+    upSince: s.upSince,
+    streakSec: s.streakSec,
+    longestStreakSec: s.longestStreakSec,
+    uptimePct24h: uptimePct("stack", m.atMs - DAY, m.atMs) ?? 0,
+    uptimePct7d: uptimePct("stack", m.atMs - 7 * DAY, m.atMs) ?? 0,
+    lastOutage: s.lastOutage,
   };
 }
 
-function level(value: number, warnAt: number, dangerAt: number, direction: "up" | "down"): Health {
+function level(value: number | null, warnAt: number, dangerAt: number, direction: "up" | "down"): Health {
+  if (value === null) return "unknown";
   if (direction === "down") return value <= dangerAt ? "down" : value <= warnAt ? "warn" : "ok";
   return value >= dangerAt ? "down" : value >= warnAt ? "warn" : "ok";
 }
 
-// One dial from its spec and the team's current thresholds.
-function dial(id: GaugeId, value: number, display: string, hint: string, live?: Gauge["live"]): Gauge {
+// One dial from its spec and the team's current thresholds. A null value shows "–" and unknown.
+function dial(id: GaugeId, value: number | null, display: string, hint: string, live?: Gauge["live"]): Gauge {
   const spec = GAUGE_SPECS[id];
   const { warnAt, dangerAt } = thresholds()[id];
   return {
     id,
     label: spec.label,
-    value,
+    value: value ?? 0,
     max: spec.max,
     unit: spec.unit,
-    display,
+    display: value === null ? "–" : display,
     health: level(value, warnAt, dangerAt, spec.direction),
     warnAt,
     dangerAt,
@@ -128,23 +135,32 @@ function dial(id: GaugeId, value: number, display: string, hint: string, live?: 
 }
 
 export function gauges(m: Moment, uptime: StackUptime): Gauge[] {
-  const { stats: s, cap } = m;
-  const lag = octopusLagSec(m.at);
-  const median = s.medianMinutesToFeed ?? 0;
-  const { warnAt: lagWarn } = thresholds()["octopus-lag"];
-  // On the live board the lag keeps counting up from the last poll until the next refresh.
-  const lagLive = m.replay ? undefined : { since: new Date(ms(m.at) - lag * 1000 + 5.5 * 3600_000).toISOString().slice(0, 19) + "+05:30", ratePerSec: 1, cap: GAUGE_SPECS["octopus-lag"].max };
-  return [
-    dial("x-cap", cap.pct, `${cap.pct}%`, `${cap.used} of ${cap.limit} daily X writes used`),
-    dial("queue", s.uploading, String(s.uploading), `${s.uploading} media ${s.uploading === 1 ? "job" : "jobs"} pending in the worker`),
-    dial("uptime", uptime.uptimePct24h, `${uptime.uptimePct24h}%`, uptime.lastOutage ? `Last outage: ${uptime.lastOutage.reason}` : "No outage in the last 24 h"),
-    dial("to-feed", median, s.medianMinutesToFeed === null ? "–" : `${median} min`, `${s.inFeed} stories in the feed today`),
-    dial("octopus-lag", lag, `${lag} s`, lag >= lagWarn ? "Octopus is not polling the feed" : "Octopus polls every minute", lagLive),
-  ];
-}
+  const sam = m.ops.samvadia.summary;
+  const soc = m.ops.socia.summary;
+  const anyOps = !!sam || !!soc;
 
-// A system with an outage covering this moment is down, whatever its alerts say.
-export function outageNow(id: SystemId, at: string): boolean {
-  const t = ms(at);
-  return OUTAGES[id].outages.some((o) => ms(o.from) <= t && (!o.to || ms(o.to) > t));
+  const stuck = anyOps ? (sam?.stuck.length ?? 0) + (soc?.stuck.length ?? 0) : null;
+  const queues = [...(sam?.queues ?? []), ...(soc?.queues ?? [])];
+  const pending = anyOps ? queues.reduce((n, q) => n + q.pending, 0) : null;
+  const upKnown = uptimePct("stack", m.atMs - DAY, m.atMs) !== null;
+  const median = sam ? sam.flow.medianMinutesToFeed : null;
+  const octopus = sam?.checks.find((c) => c.id === "octopus");
+  const lag = octopus?.lastOkAt ? Math.max(0, Math.round((m.atMs - Date.parse(octopus.lastOkAt)) / 1000)) : null;
+  const { warnAt: lagWarn } = thresholds()["octopus-lag"];
+  // On the live board the lag keeps counting up from the last poll until the next refresh
+  const lagLive = !m.replay && octopus?.lastOkAt ? { since: octopus.lastOkAt, ratePerSec: 1, cap: GAUGE_SPECS["octopus-lag"].max } : undefined;
+  const why = (src: string | null) => src ?? "No data";
+
+  return [
+    dial("stuck", stuck, String(stuck), stuck === null ? why(m.ops.samvadia.problem ?? m.ops.socia.problem) : stuck ? `${stuck} ${stuck === 1 ? "story waits" : "stories wait"} past the stage limit` : "Nothing stuck"),
+    dial("queue", pending, String(pending), pending === null ? why(m.ops.samvadia.problem) : `${pending} ${pending === 1 ? "job" : "jobs"} pending in the job queues`),
+    dial(
+      "uptime",
+      upKnown ? uptime.uptimePct24h : null,
+      `${uptime.uptimePct24h}%`,
+      !upKnown ? "No health history yet" : uptime.lastOutage ? `Last outage: ${uptime.lastOutage.reason}` : "No outage in the last 24 h",
+    ),
+    dial("to-feed", median, `${median} min`, sam ? `${sam.flow.inFeed} stories in the feed today` : why(m.ops.samvadia.problem)),
+    dial("octopus-lag", lag, `${lag} s`, lag === null ? (sam ? "Samvadia has not seen Octopus fetch the feed" : why(m.ops.samvadia.problem)) : lag >= lagWarn ? "Octopus is not fetching the feed" : "Octopus fetches the feed", lagLive),
+  ];
 }

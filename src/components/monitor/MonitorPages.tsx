@@ -80,7 +80,7 @@ export function TelemetryView() {
                 ) : null}
               </Panel>
               <Panel n={2} title="Replay" id="replay">
-                <JogWheel liveAsOf={live.asOf} replayAt={replayAt} marks={outageMarks(live)} onScrub={setReplay} />
+                <JogWheel liveAsOf={live.asOf} fromIso={live.replayFrom} replayAt={replayAt} marks={outageMarks(live)} onScrub={setReplay} />
               </Panel>
             </Box>
             <Panel n={3} title={replayAt ? `Events up to ${hmIst(replayAt)}` : "Events"} id="events">

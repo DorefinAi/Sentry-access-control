@@ -1,163 +1,149 @@
-import type { Evidence, SystemId, Trace, TraceSearchHit, TraceStep } from "@/types/control";
-import { logIdFor } from "@/data/logs";
-import { STORIES, STORY_BY_SLUG, type Story } from "@/data/stories";
-import { waitingMinutes } from "@/data/stats";
-import { minutesBetween } from "@/data/time";
-import { MAX_UPLOAD_MB } from "@/data/world";
+// Where is a story? Asks both backends (GET /owner/ops/story/{slug}) and joins the two paths by
+// slug: Samvadia's steps (intake to Octopus) first, then Socia's (ingest to X), since Socia keeps
+// the Samvadia slug. The story's own log lines (slug set on the line) are added to the steps as
+// evidence, and unresolved alerts that name the story are added to the step that is stuck.
+import type { Evidence, LogEntry, SystemId, Trace, TraceSearchHit, TraceSearchResult, TraceStep } from "@/types/control";
+import { SYSTEM_LABEL } from "@/types/people";
+import { listAlerts } from "./alerts";
 import { cleanEvidence } from "./evidence";
-import { notFound } from "./http";
-import { store } from "./store";
+import { HttpError, notFound } from "./http";
+import { logsForSlug } from "./logs";
+import { fetchStories, fetchStory } from "./ops/client";
+import { opsState } from "./ops/pull";
+import { OPS_SOURCES, type OpsSource, type OpsStory, type StoryState } from "./ops/types";
+import { hhmm } from "./time";
+import { isSystemId } from "./validate";
 
-const RECEIVED: Record<Story["source"], [SystemId, string]> = {
-  whatsapp: ["whatsapp", "Received on WhatsApp"],
-  outlook: ["outlook", "Received by email (Outlook)"],
-  portal: ["reporter-portal", "Submitted on Reporter portal"],
+const STAGE_SYSTEM: Record<string, SystemId> = {
+  intake: "samvadia-api",
+  desk: "assignment-desk",
+  ftp: "ftp",
+  feed: "samvadia-api",
+  octopus: "octopus",
+  ingest: "socia-ingest",
+  convert: "socia-ingest",
+  compose: "socia-ingest",
+  render: "socia-render",
+  operator: "digital-desk",
+  publish: "x",
 };
+const STATE_RANK: Record<StoryState, number> = { done: 0, on_track: 1, stuck: 2, failed: 3 };
+const PER_STEP_LOGS = 5;
+const NEAR_MS = 15 * 60_000;
 
-const UNMATCHED_AFTER_MIN = 15;
+const configured = () => OPS_SOURCES.filter((s) => opsState(s).configured);
 
-function logEv(slug: string, step: string, label = "Log line"): Evidence[] {
-  const id = logIdFor(`${slug}:${step}`);
-  return id ? [{ kind: "log", id, label }] : [];
+export async function searchTraces(q: string | null, fetchImpl?: typeof fetch): Promise<TraceSearchResult> {
+  const sources = configured();
+  const errors: string[] = [];
+  const hits = new Map<string, TraceSearchHit>();
+  await Promise.all(
+    sources.map(async (source) => {
+      try {
+        // Every day the backend still has (contract v1.1 date=all); an older backend refuses that, so ask it for today
+        const query = { q: q?.trim() || undefined, limit: 20, fetchImpl };
+        const found = await fetchStories(source, { ...query, date: "all" }).catch((e: unknown) => {
+          if (e instanceof HttpError && e.status >= 400 && e.status < 500 && e.status !== 429) return fetchStories(source, query);
+          throw e;
+        });
+        for (const h of found) {
+          const known = hits.get(h.slug);
+          // The same slug in both backends: keep the first time it was received
+          if (!known || Date.parse(h.receivedAt) < Date.parse(known.receivedAt)) hits.set(h.slug, { slug: h.slug, headline: h.headline || known?.headline || "", receivedAt: h.receivedAt });
+        }
+      } catch (e) {
+        errors.push(`${SYSTEM_LABEL[source]}: ${(e as Error).message}`);
+      }
+    }),
+  );
+  if (sources.length && errors.length === sources.length) throw new HttpError(503, "backend_unavailable", `Could not search for stories. ${errors.join(" ")}`);
+  if (errors.length) console.error(`[trace] search left out a backend: ${errors.join(" ")}`);
+  return {
+    hits: [...hits.values()].sort((a, b) => Date.parse(b.receivedAt) - Date.parse(a.receivedAt)).slice(0, 20),
+    partial: errors.length ? errors.join(" ") : null,
+  };
 }
 
-function alertEv(slug: string): Evidence[] {
-  return store()
-    .alerts.filter((a) => a.state !== "resolved" && a.evidence.some((e) => e.kind === "trace" && e.id === slug))
-    .map((a) => ({ kind: "alert" as const, id: a.id, label: a.title }));
+function toSteps(source: OpsSource, story: OpsStory): TraceStep[] {
+  return story.steps.map((s) => ({
+    at: s.at,
+    system: isSystemId(s.system) ? s.system : (STAGE_SYSTEM[s.stage] ?? (source === "samvadia" ? "samvadia-api" : "socia-api")),
+    stage: s.label,
+    state: s.state,
+    ...(s.detail ? { detail: s.detail } : {}),
+  }));
 }
 
-function waiting(system: SystemId, stage: string, detail?: string): TraceStep {
-  return { at: null, system, stage, state: "waiting", detail };
+const logLabel = (l: LogEntry) => `${l.level === "error" ? "Error" : l.level === "warn" ? "Warning" : "Log"} ${hhmm(l.at)}: ${l.message.slice(0, 60)}`;
+
+/**
+ * Puts each log line on the step of the same system nearest in time (else the nearest step).
+ * Each step keeps every error line plus the latest PER_STEP_LOGS other lines.
+ */
+export function attachLogs(steps: TraceStep[], logs: LogEntry[]): void {
+  const timed = steps.map((s, i) => ({ i, t: s.at ? Date.parse(s.at) : null, system: s.system }));
+  const per = new Map<number, LogEntry[]>();
+  for (const l of logs) {
+    const t = Date.parse(l.at);
+    const near = (c: (typeof timed)[number]) => (c.t === null ? Infinity : Math.abs(c.t - t));
+    const same = timed.filter((c) => c.system === l.system && near(c) <= NEAR_MS).sort((a, b) => near(a) - near(b))[0];
+    const any = timed.filter((c) => c.t !== null).sort((a, b) => near(a) - near(b))[0];
+    const target = same ?? any;
+    if (target) per.set(target.i, [...(per.get(target.i) ?? []), l]);
+  }
+  for (const [i, lines] of per) {
+    const sorted = [...lines].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+    const latest = new Set(sorted.filter((l) => l.level !== "error").slice(-PER_STEP_LOGS));
+    const kept = sorted.filter((l) => l.level === "error" || latest.has(l));
+    steps[i].evidence = [...(steps[i].evidence ?? []), ...kept.map((l): Evidence => ({ kind: "log", id: l.id, label: logLabel(l) }))];
+  }
 }
 
-export function buildTrace(s: Story): Trace {
-  const { slug } = s;
-  const files = s.files ?? { count: 0, mb: 0 };
-  const steps: TraceStep[] = [];
-  let state: Trace["state"] = "done";
-  let stuckAt: string | null = null;
-
-  const [srcSystem, srcStage] = RECEIVED[s.source];
-  steps.push({
-    at: s.receivedAt,
-    system: srcSystem,
-    stage: srcStage,
-    state: "done",
-    detail: s.reporter
-      ? `from ${s.reporter} (${s.from}), ${files.count} files, ${files.mb} MB`
-      : `from unknown number ${s.from}, no reporter matched; ${files.count} file, ${files.mb} MB`,
-    evidence: logEv(slug, "received"),
-  });
-
-  if (s.desk === "waiting") {
-    const mins = waitingMinutes(s);
-    steps.push(waiting("assignment-desk", "Desk review", `waiting ${mins} min${s.reporter ? "" : " as needs_desk"}`));
-    steps.at(-1)!.evidence = alertEv(slug);
-    steps.push(waiting("ftp", "Uploaded to FTP"), waiting("samvadia-api", "Added to feed"), waiting("octopus", "Collected by Octopus"));
-    if (mins >= UNMATCHED_AFTER_MIN && !s.reporter) {
-      state = "stuck";
-      stuckAt = "Desk review";
-    } else {
-      state = "on_track";
-    }
-    return { slug, headline: s.headline, reporter: s.reporter, city: s.city, source: s.source, state, stuckAt, steps };
+export async function getTrace(slug: string, fetchImpl?: typeof fetch): Promise<Trace> {
+  const clean = slug.trim();
+  if (!clean || clean.length > 120) throw notFound(`No story with slug ${slug}.`);
+  const sources = configured();
+  const errors: string[] = [];
+  const found: [OpsSource, OpsStory][] = [];
+  await Promise.all(
+    sources.map(async (source) => {
+      try {
+        const s = (await fetchStory(source, clean, fetchImpl)) ?? (clean !== clean.toUpperCase() ? await fetchStory(source, clean.toUpperCase(), fetchImpl) : null);
+        if (s) found.push([source, s]);
+      } catch (e) {
+        errors.push(`${SYSTEM_LABEL[source]}: ${(e as Error).message}`);
+      }
+    }),
+  );
+  found.sort((a, b) => (a[0] === b[0] ? 0 : a[0] === "samvadia" ? -1 : 1));
+  if (errors.length) console.error(`[trace] ${clean}: ${errors.join(" ")}`);
+  if (!found.length) {
+    if (errors.length) throw new HttpError(503, "backend_unavailable", `Could not look the story up. ${errors.join(" ")}`);
+    throw notFound(`No story with slug ${clean}. Check the spelling, or search with /api/trace?q=.`);
   }
 
-  if (s.desk === "rejected") {
-    steps.push({ at: s.deskAt!, system: "assignment-desk", stage: "Rejected by desk", state: "done", detail: `by ${s.deskBy}: ${s.rejectReason}`, evidence: logEv(slug, "desk") });
-    return { slug, headline: s.headline, reporter: s.reporter, city: s.city, source: s.source, state: "done", stuckAt: null, steps };
-  }
+  const steps = found.flatMap(([source, s]) => toSteps(source, s));
+  const worstStory = found.reduce((a, b) => (STATE_RANK[b[1].state] > STATE_RANK[a[1].state] ? b : a))[1];
+  // Samvadia done but Socia still working on it: the story as a whole is on track
+  const state = found.reduce<StoryState>((acc, [, s]) => (STATE_RANK[s.state] > STATE_RANK[acc] ? s.state : acc), "done");
+  const stuckStep = worstStory.stuckAt ? worstStory.steps.find((s) => s.stage === worstStory.stuckAt) : null;
+  const main = found[0][1];
+  const theSlug = main.slug;
 
-  steps.push({ at: s.deskAt!, system: "assignment-desk", stage: "Approved by desk", state: "done", detail: `by ${s.deskBy}`, evidence: logEv(slug, "desk") });
+  attachLogs(steps, logsForSlug(theSlug));
+  const alerts = listAlerts().filter((a) => a.state !== "resolved" && a.evidence.some((e) => e.kind === "trace" && e.id === theSlug));
+  const problem = steps.find((s) => s.state === "failed") ?? steps.find((s) => s.state === "waiting");
+  if (problem && alerts.length) problem.evidence = [...alerts.map((a): Evidence => ({ kind: "alert", id: a.id, label: a.title })), ...(problem.evidence ?? [])];
 
-  if (s.ftp === "failed") {
-    const sizes = (s.oversize ?? []).map((f) => `${f.name} ${f.mb} MB`).join(", ");
-    steps.push({
-      at: s.ftpAttempts!.at(-1)!,
-      system: "ftp",
-      stage: "Uploaded to FTP",
-      state: "failed",
-      detail: `refused: ${sizes}; limit ${MAX_UPLOAD_MB} MB; ${s.ftpAttempts!.length} attempts`,
-      evidence: [...logEv(slug, "ftp-failed", "Failed for good"), ...alertEv(slug)],
-    });
-    steps.push(waiting("samvadia-api", "Added to feed", "needs the files on FTP first"), waiting("octopus", "Collected by Octopus"));
-    return { slug, headline: s.headline, reporter: s.reporter, city: s.city, source: s.source, state: "stuck", stuckAt: "Uploaded to FTP", steps };
-  }
-  if (s.ftp === "uploading") {
-    steps.push(waiting("ftp", "Uploaded to FTP", `uploading ${files.count} files, ${files.mb} MB`));
-    steps.at(-1)!.evidence = logEv(slug, "ftp");
-    steps.push(waiting("samvadia-api", "Added to feed"), waiting("octopus", "Collected by Octopus"));
-    return { slug, headline: s.headline, reporter: s.reporter, city: s.city, source: s.source, state: "on_track", stuckAt: null, steps };
-  }
-
-  steps.push({ at: s.ftpAt!, system: "ftp", stage: "Uploaded to FTP", state: "done", detail: `${files.count} files, ${files.mb} MB to vartmaan/incoming/${slug}/`, evidence: logEv(slug, "ftp") });
-  steps.push({ at: s.feedAt!, system: "samvadia-api", stage: "Added to feed", state: "done", detail: `GUID vartmaan-${slug}-v1`, evidence: logEv(slug, "feed") });
-
-  const late = minutesBetween(s.feedAt!, s.collectedAt!);
-  steps.push({
-    at: s.collectedAt!,
-    system: "octopus",
-    stage: "Collected by Octopus",
-    state: "done",
-    detail: late > 2 ? `${late} min late: Octopus was not polling (INC-0007)` : "next poll returned 200",
-    evidence: [
-      ...logEv(slug, "collected"),
-      ...(late > 2 ? [{ kind: "incident" as const, id: "INC-0007", label: "INC-0007" }] : []),
-    ],
-  });
-
-  if (s.ingestAt) {
-    steps.push({ at: s.ingestAt, system: "socia-ingest", stage: "Taken in by Socia", state: "done", evidence: logEv(slug, "ingest") });
-    if (s.digital === "skipped") {
-      steps.push({ at: null, system: "socia-render", stage: "Card rendered", state: "skipped", detail: "text only, no visuals for a card" });
-    } else if (s.digital === "render_failed") {
-      const attempts = s.renderAttempts ?? [];
-      steps.push({
-        at: attempts.at(-1) ?? null,
-        system: "socia-render",
-        stage: "Card rendered",
-        state: "failed",
-        detail: `headline overflows the card text box; ${attempts.length} attempts`,
-        evidence: [...logEv(slug, "render-failed", "Gave up"), ...alertEv(slug)],
-      });
-      steps.push(waiting("digital-desk", "Approved by operator"), waiting("x", "Posted on X"));
-      state = "failed";
-      stuckAt = "Card rendered";
-    } else if (s.renderAt) {
-      steps.push({ at: s.renderAt, system: "socia-render", stage: "Card rendered", state: "done", detail: "1080x1350", evidence: logEv(slug, "render") });
-    }
-
-    if (s.digital === "waiting_operator") {
-      steps.push(waiting("digital-desk", "Approved by operator"), waiting("x", "Posted on X"));
-      state = "on_track";
-    } else if (s.digital === "operator_rejected") {
-      steps.push({ at: s.operatorAt!, system: "digital-desk", stage: "Rejected by operator", state: "done", detail: `by ${s.operator}`, evidence: logEv(slug, "operator") });
-    } else if (s.operatorAt) {
-      steps.push({ at: s.operatorAt, system: "digital-desk", stage: "Approved by operator", state: "done", detail: `by ${s.operator}`, evidence: logEv(slug, "operator") });
-    }
-    if (s.postedAt) {
-      steps.push({ at: s.postedAt, system: "x", stage: "Posted on X", state: "done", detail: `post id ${s.xPostId} (fake mode)`, evidence: logEv(slug, "posted") });
-    }
-    if (s.recalledAt) {
-      steps.push({ at: s.recalledAt, system: "x", stage: "Recalled from X", state: "done", detail: s.recallReason, evidence: logEv(slug, "recalled") });
-    }
-  }
-
-  return { slug, headline: s.headline, reporter: s.reporter, city: s.city, source: s.source, state, stuckAt, steps };
-}
-
-export function getTrace(slug: string): Trace {
-  const story = STORY_BY_SLUG.get(slug) ?? STORY_BY_SLUG.get(slug.toUpperCase());
-  if (!story) throw notFound(`No story with slug ${slug}. Check the spelling, or search with /api/trace?q=.`);
-  const trace = buildTrace(story);
-  return { ...trace, steps: trace.steps.map((st) => (st.evidence ? { ...st, evidence: cleanEvidence(st.evidence) } : st)) };
-}
-
-export function searchTraces(q: string | null): TraceSearchHit[] {
-  const needle = (q ?? "").trim().toLowerCase();
-  return STORIES.filter((s) => !needle || s.slug.toLowerCase().includes(needle) || s.headline.toLowerCase().includes(needle))
-    .sort((a, b) => Date.parse(b.receivedAt) - Date.parse(a.receivedAt))
-    .slice(0, 20)
-    .map((s) => ({ slug: s.slug, headline: s.headline, receivedAt: s.receivedAt }));
+  return {
+    slug: theSlug,
+    headline: found.map(([, s]) => s.headline).find(Boolean) ?? "",
+    reporter: found.map(([, s]) => s.reporter).find(Boolean) ?? null,
+    city: found.map(([, s]) => s.city).find(Boolean) ?? null,
+    source: ((src) => (src === "share" ? null : src))(found.map(([, s]) => s.source).find(Boolean) ?? null),
+    state,
+    stuckAt: state === "stuck" || state === "failed" ? (stuckStep?.label ?? worstStory.stuckAt) : null,
+    steps: steps.map((s) => (s.evidence ? { ...s, evidence: cleanEvidence(s.evidence) } : s)),
+    partial: errors.length ? errors.join(" ") : null,
+  };
 }

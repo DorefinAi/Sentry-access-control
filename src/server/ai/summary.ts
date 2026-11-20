@@ -1,14 +1,14 @@
-// Written text for Phase 1. Each template prints only numbers from the facts it builds, and every
-// summary is checked by verifyNumbers against those same curated facts (never raw records).
+// Written text from static templates (no AI yet: model "static"). Each template prints only numbers
+// from the real facts it is given (ops summaries, alerts, incidents, log counts), and every summary
+// is checked by verifyNumbers against those same facts.
 import type { AiSummary, Alert, Evidence, Incident } from "@/types/control";
-import { YESTERDAY_FLOW } from "@/data/daily";
-import { SYSTEM_BY_ID } from "@/data/systems";
-import { hhmm, ms, TODAY } from "@/data/time";
-import { BACKUP, OCTOPUS_GAP } from "@/data/world";
-import type { IncidentRecord } from "@/data/incidents";
+import { SYSTEM_LABEL } from "@/types/people";
+import { systemName } from "../catalog";
 import { cleanEvidence } from "../evidence";
+import type { IncidentRecord } from "../incidents";
 import type { LogStats } from "../logs";
-import type { Moment } from "../moment";
+import type { OpsSummary } from "../ops/types";
+import { hhmm } from "../time";
 import { verifyNumbers, type Facts } from "./verifyNumbers";
 
 export const STATIC_MODEL = "static";
@@ -30,57 +30,57 @@ export function headlineFor(alerts: Alert[]): string {
   return n === 0 ? "All good" : `${n} ${n === 1 ? "thing needs" : "things need"} you`;
 }
 
-function incidentQuotes(list: IncidentRecord[]): string[] {
-  return list.flatMap((i) => [i.id, i.title, i.impact.summary]);
+/** What one day's paragraph is written from. */
+export interface DayFacts {
+  date: string;
+  today: boolean; // true: describes now (open alerts count); false: a past day's totals
+  samvadia: OpsSummary | null;
+  socia: OpsSummary | null;
+  problems: string[]; // why a backend's numbers are missing
+  alerts: Alert[];
+  incidents: IncidentRecord[]; // opened that day
 }
 
-// For today the text describes the moment m (live, or a replay); other days use their totals.
-export function dayNarrative(date: string, m: Moment, generatedAt: string): AiSummary {
-  const { alerts, incidents } = m;
-  const dayIncidents = incidents.filter((i) => i.openedAt.startsWith(date));
-  const evidence: Evidence[] = dayIncidents.map((i) => ({ kind: "incident", id: i.id, label: `${i.id}: ${i.title}` }));
-
-  if (date !== TODAY) {
-    const f = YESTERDAY_FLOW;
-    const parts = [
-      `${f.storiesIn} stories came in (${f.bySource.whatsapp} WhatsApp, ${f.bySource.outlook} Outlook, ${f.bySource.portal} portal); ${f.approved} approved, ${f.rejected} rejected, ${f.inFeed} in the feed and ${f.collected} collected by Octopus.`,
-      `Median time to feed was ${f.medianMinutesToFeed} min. ${f.xPosts} posts went out on X.`,
-      ...dayIncidents.map((i) => `${i.id} (${i.status}): ${i.title}; ${i.impact.summary}.`),
-    ];
-    return makeSummary(parts.join(" "), evidence, { values: { flow: f }, quotable: incidentQuotes(dayIncidents) }, generatedAt);
-  }
-
-  const s = m.stats;
-  const cap = m.cap;
-  const backupDone = ms(m.at) >= ms(BACKUP.finishedAt);
-  const open = needsYou(alerts);
-  const octopus = dayIncidents.find((i) => i.systems.includes("octopus"));
-  const times = [hhmm(OCTOPUS_GAP.from), hhmm(OCTOPUS_GAP.resumedAt), hhmm(BACKUP.ranAt), hhmm(OCTOPUS_GAP.lastPollBefore)];
-
+export function dayNarrative(f: DayFacts, generatedAt: string): AiSummary {
+  const evidence: Evidence[] = f.incidents.map((i) => ({ kind: "incident", id: i.id, label: `${i.id}: ${i.title}` }));
+  const open = f.today ? needsYou(f.alerts) : [];
   const lines: string[] = [];
-  lines.push(
-    open.length ? `**${headlineFor(alerts)}.**` : "**All good right now.**",
-    `${s.storiesIn} stories came in today (${s.bySource.whatsapp} WhatsApp, ${s.bySource.outlook} Outlook, ${s.bySource.portal} portal); ${s.approved} approved, ${s.rejected} rejected, ${s.inFeed} in the feed and ${s.collected} collected by Octopus. Median time to feed is ${s.medianMinutesToFeed} min.`,
-  );
+  if (f.today) lines.push(open.length ? `**${headlineFor(f.alerts)}.**` : "**All good right now.**");
+
+  const s = f.samvadia;
+  if (s) {
+    const b = s.flow.bySource;
+    lines.push(
+      `${plural(s.flow.storiesIn, "story", "stories")} came in${f.today ? " today" : ""} (${b.whatsapp} WhatsApp, ${b.outlook} Outlook, ${b.portal} portal); ${s.flow.approved} approved, ${s.flow.rejected} rejected, ${s.flow.inFeed} in the feed and ${s.flow.collected} collected by Octopus.` +
+        (s.flow.medianMinutesToFeed !== null ? ` Median time to feed ${f.today ? "is" : "was"} ${s.flow.medianMinutesToFeed} min.` : ""),
+    );
+    if (s.stuck.length) lines.push(`${plural(s.stuck.length, "story is", "stories are")} stuck in Samvadia.`);
+  }
+  const x = f.socia;
+  if (x) {
+    lines.push(`Socia took in ${plural(x.flow.storiesIn, "breaking story", "breaking stories")}; ${x.flow.posts} marked posted on X, ${x.flow.recalled} recalled.`);
+    if (x.stuck.length) lines.push(`${plural(x.stuck.length, "item is", "items are")} stuck in Socia.`);
+  }
+  for (const p of f.problems) lines.push(p);
   if (open.length) {
     lines.push(`Not fixed yet: ${open.map((a) => a.title).join("; ")}.`);
     evidence.unshift(...open.map((a) => ({ kind: "alert" as const, id: a.id, label: a.title })));
   }
-  if (octopus) {
-    lines.push(
-      octopus.status !== "resolved" && ms(m.at) < ms(OCTOPUS_GAP.resumedAt)
-        ? `Octopus has not polled since ${times[3]}; incident ${octopus.id} is open.`
-        : `Octopus was blind ${octopus.impact.minutesBlind} min (${times[0]} to ${times[1]}); ${plural(octopus.impact.storiesDelayed, "story", "stories")} reached it late${octopus.status === "resolved" ? " and it has recovered" : ""}.`,
-    );
-  }
-  lines.push(`On X: ${s.xPosts} posts, ${s.xRecalled} recalled, ${cap.pct}% of the daily cap used.${backupDone ? ` Backup ran at ${times[2]} OK.` : ""}`);
+  for (const i of f.incidents) lines.push(`${i.id} (${i.status}): ${i.title}.`);
+  if (lines.length === (f.today ? 1 : 0)) lines.push(`Sentry has no numbers for ${f.date}.`);
 
   const facts: Facts = {
-    values: { stats: s, capPct: cap.pct, needYou: open.length, octopus: octopus?.impact },
-    quotable: [...open.map((a) => a.title), ...times, octopus?.id],
+    values: { samvadia: s && { flow: s.flow, stuck: s.stuck.length }, socia: x && { flow: x.flow, stuck: x.stuck.length }, needYou: open.length },
+    quotable: [f.date, ...open.map((a) => a.title), ...f.problems, ...f.incidents.flatMap((i) => [i.id, i.title])],
   };
   return makeSummary(lines.join(" "), evidence, facts, generatedAt);
 }
+
+/** A backend's numbers are missing: the plain reason, for the paragraph. */
+export const missingLine = (source: "samvadia" | "socia", problem: string | null) => {
+  const why = (problem ?? "no data").trim();
+  return `No numbers from ${SYSTEM_LABEL[source]}: ${why}${/[.?!]$/.test(why) ? "" : "."}`;
+};
 
 export function incidentDraft(i: IncidentRecord, generatedAt: string): AiSummary {
   const openFollowUps = i.followUps.filter((f) => !f.done).length;
@@ -118,7 +118,7 @@ export function withDraft(i: IncidentRecord, generatedAt: string): Incident {
 export function logsSummary(stats: LogStats, scopeLabel: string, generatedAt: string): AiSummary {
   const { total, byLevel, topError } = stats;
   const topSystems = stats.bySystem.slice(0, 3);
-  const name = (id: string) => SYSTEM_BY_ID.get(id as never)?.name ?? id;
+  const name = (id: string) => systemName(id);
 
   // Only the counts are facts; the scope label, system names and the quoted error are repeated verbatim.
   const facts: Facts = {

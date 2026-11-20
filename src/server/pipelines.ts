@@ -1,117 +1,100 @@
-import type { Alert, Health, Pipeline, PipelineStage } from "@/types/control";
-import { waitingMinutes } from "@/data/stats";
-import { SLUGS } from "@/data/stories";
-import { hhmm, ms } from "@/data/time";
-import { MAX_UPLOAD_MB, OCTOPUS_GAP } from "@/data/world";
-import { octopusLagSec } from "./mission";
+// Both pipelines, stage by stage, from the backends' ops summaries (contract section 1.1):
+// Samvadia's stages make "assignment", Socia's make "digital". The number on a stage is the
+// contract's count; waiting, failed and stuck items go in the note and colour the stage.
+// A backend Sentry cannot read gives "unknown" stages with the reason, never numbers.
+import type { Alert, Health, Pipeline, PipelineId, PipelineStage, SystemId } from "@/types/control";
 import type { Moment } from "./moment";
+import type { OpsSource } from "./ops/types";
 import { worst } from "./systems";
 
-// Which stage each alert rule colours.
-const STAGE_OF_RULE: Record<string, string> = {
-  "mail-dead": "intake",
-  "desk-unmatched": "desk",
-  "ftp-upload-failed": "ftp",
-  "octopus-silent": "octopus",
-  "render-failed": "render",
-  "x-cap": "publish",
-};
-
-function stageHealth(stageId: string, alerts: Alert[]): Health {
-  return worst(
-    alerts
-      .filter((a) => a.state !== "resolved" && STAGE_OF_RULE[a.ruleId] === stageId)
-      .map((a): Health => (a.severity === "critical" ? "down" : a.severity === "warning" ? "warn" : "ok")),
-  );
+interface StageSpec {
+  id: string;
+  label: string;
+  countLabel: string;
+  systems: SystemId[];
+  checks?: string[]; // backend check ids whose failure colours this stage
 }
 
-function octopusNote(at: string): string {
-  const lag = `last poll ${octopusLagSec(at)} s ago`;
-  if (ms(at) < ms(OCTOPUS_GAP.from)) return lag;
-  if (ms(at) < ms(OCTOPUS_GAP.resumedAt)) return `no poll since ${hhmm(OCTOPUS_GAP.lastPollBefore)}`;
-  return `${lag}; blind ${hhmm(OCTOPUS_GAP.from)} to ${hhmm(OCTOPUS_GAP.resumedAt)} (INC-0007)`;
+const PIPELINES: { id: PipelineId; source: OpsSource; name: string; stages: StageSpec[] }[] = [
+  {
+    id: "assignment",
+    source: "samvadia",
+    name: "Assignment: intake to Octopus",
+    stages: [
+      { id: "intake", label: "Intake", countLabel: "in today", systems: ["whatsapp", "outlook", "reporter-portal", "samvadia-api"], checks: ["whatsapp", "outlook"] },
+      { id: "desk", label: "Desk", countLabel: "decided today", systems: ["assignment-desk", "samvadia-api"] },
+      { id: "ftp", label: "FTP", countLabel: "uploaded today", systems: ["ftp", "samvadia-worker"], checks: ["ftp"] },
+      { id: "feed", label: "Feed", countLabel: "in feed today", systems: ["samvadia-api"] },
+      { id: "octopus", label: "Octopus", countLabel: "collected today", systems: ["octopus"], checks: ["octopus"] },
+    ],
+  },
+  {
+    id: "digital",
+    source: "socia",
+    name: "Digital: breaking news to X",
+    stages: [
+      { id: "ingest", label: "Ingest", countLabel: "taken in", systems: ["socia-ingest"], checks: ["share"] },
+      { id: "convert", label: "Convert", countLabel: "converted", systems: ["socia-ingest"] },
+      { id: "compose", label: "Compose", countLabel: "drafts made", systems: ["socia-ingest"] },
+      { id: "render", label: "Render", countLabel: "cards made", systems: ["socia-render"] },
+      { id: "operator", label: "Operator", countLabel: "acted on", systems: ["digital-desk"] },
+      { id: "publish", label: "Publish", countLabel: "posted on X", systems: ["socia-publish", "x"] },
+    ],
+  },
+];
+
+const sevHealth = (a: Alert): Health => (a.severity === "critical" ? "down" : a.severity === "warning" ? "warn" : "ok");
+
+/** Health a stage gets from unresolved alerts about it (stuck stories there, its checks failing). */
+function alertHealth(spec: StageSpec, alerts: Alert[]): Health {
+  const about = alerts.filter((a) => {
+    if (a.state === "resolved") return false;
+    if (a.ruleId === "stories-stuck") return a.title.includes(` at ${spec.id} in `) && a.systems.some((s) => spec.systems.includes(s));
+    if (a.ruleId === "check-failing") return (spec.checks ?? []).some((c) => a.title.toLowerCase().includes(c));
+    if (a.ruleId === "heartbeat-stale" || a.ruleId === "service-down") return a.systems.some((s) => spec.systems.includes(s)) && a.severity === "critical";
+    return false;
+  });
+  return worst(about.map(sevHealth));
 }
+
+const minutesSince = (iso: string, now: number) => Math.max(0, Math.round((now - Date.parse(iso)) / 60_000));
 
 export function buildPipelines(m: Moment): Pipeline[] {
-  const { stats: s, cap, alerts } = m;
-  const unknown = m.stories.find((st) => st.slug === SLUGS.unknown && st.desk === "waiting");
-  const stage = (st: Omit<PipelineStage, "health">): PipelineStage => ({ ...st, health: stageHealth(st.id, alerts) });
-
-  const assignment: PipelineStage[] = [
-    stage({
-      id: "intake",
-      label: "Intake",
-      count: s.storiesIn,
-      countLabel: "in today",
-      systems: ["whatsapp", "outlook", "reporter-portal", "samvadia-api"],
-      note: `${s.bySource.whatsapp} WhatsApp, ${s.bySource.outlook} Outlook, ${s.bySource.portal} portal`,
-    }),
-    stage({
-      id: "desk",
-      label: "Desk",
-      count: s.waitingDesk,
-      countLabel: "waiting",
-      systems: ["assignment-desk", "samvadia-api"],
-      note: unknown ? `${s.waitingDesk} waiting; 1 from an unknown number for ${waitingMinutes(unknown, m.at)} min` : `${s.waitingDesk} waiting`,
-    }),
-    stage({
-      id: "ftp",
-      label: "FTP",
-      count: s.ftpFailedFiles,
-      countLabel: "uploads failed",
-      systems: ["ftp", "samvadia-worker"],
-      note: `${s.ftpFailedFiles} uploads refused (over ${MAX_UPLOAD_MB} MB); ${s.uploading} ${s.uploading === 1 ? "upload" : "uploads"} running`,
-    }),
-    stage({
-      id: "feed",
-      label: "Feed",
-      count: s.inFeed,
-      countLabel: "in feed today",
-      systems: ["samvadia-api"],
-      note: `median ${s.medianMinutesToFeed} min from intake to feed`,
-    }),
-    stage({
-      id: "octopus",
-      label: "Octopus",
-      count: s.collected,
-      countLabel: "collected today",
-      systems: ["octopus"],
-      note: octopusNote(m.at),
-    }),
-  ];
-
-  const digital: PipelineStage[] = [
-    stage({ id: "ingest", label: "Ingest", count: s.ingested, countLabel: "taken in", systems: ["socia-ingest"], note: `${s.skipped} skipped (no visuals)` }),
-    stage({ id: "convert", label: "Convert", count: s.drafts, countLabel: "converted", systems: ["socia-api"] }),
-    stage({ id: "compose", label: "Compose", count: s.drafts, countLabel: "drafts made", systems: ["socia-api", "ollama"] }),
-    stage({
-      id: "render",
-      label: "Render",
-      count: s.renderFailed,
-      countLabel: "failed",
-      systems: ["socia-render"],
-      note: `${s.drafts - s.renderFailed} cards made; ${s.renderFailed} failed on text overflow`,
-    }),
-    stage({
-      id: "operator",
-      label: "Operator",
-      count: s.waitingOperator,
-      countLabel: "waiting",
-      systems: ["digital-desk"],
-      note: `${s.operatorRejected} rejected by an operator today`,
-    }),
-    stage({
-      id: "publish",
-      label: "Publish",
-      count: s.xPosts,
-      countLabel: "posted on X",
-      systems: ["socia-publish", "x"],
-      note: `${s.xRecalled} recalled; daily cap ${cap.pct}% used (fake mode)`,
-    }),
-  ];
-
-  return [
-    { id: "assignment", name: "Assignment: intake to Octopus", health: worst(assignment.map((x) => x.health)), stages: assignment },
-    { id: "digital", name: "Digital: feed to X", health: worst(digital.map((x) => x.health)), stages: digital },
-  ];
+  return PIPELINES.map((p) => {
+    const view = m.ops[p.source];
+    const summary = view.summary;
+    const stages: PipelineStage[] = p.stages.map((spec) => {
+      if (!summary) {
+        return { id: spec.id, label: spec.label, health: "unknown", count: 0, countLabel: "no data", systems: spec.systems, note: view.problem ?? "No data" };
+      }
+      const st = summary.stages.find((s) => s.id === spec.id);
+      if (!st) {
+        return { id: spec.id, label: spec.label, health: "unknown", count: 0, countLabel: "not reported", systems: spec.systems, note: "The backend does not report this stage." };
+      }
+      const stuck = summary.stuck.filter((s) => s.stage === spec.id);
+      const notes = [
+        st.waiting ? `${st.waiting} waiting${st.oldestWaitingAt ? `, oldest ${minutesSince(st.oldestWaitingAt, m.atMs)} min` : ""}` : null,
+        st.failed ? `${st.failed} failed today` : null,
+        stuck.length ? `${stuck.length} stuck over the limit` : null,
+        st.note,
+      ].filter(Boolean);
+      const own: Health = stuck.length || st.failed ? "warn" : "ok";
+      return {
+        id: spec.id,
+        label: spec.label,
+        health: worst([own, alertHealth(spec, m.alerts)]),
+        count: st.count,
+        countLabel: spec.countLabel,
+        systems: spec.systems,
+        note: notes.length ? notes.join("; ") : "Nothing waiting",
+      };
+    });
+    // A stage the backend reports that Sentry has no name for still shows
+    for (const st of summary?.stages ?? []) {
+      if (p.stages.some((s) => s.id === st.id)) continue;
+      stages.push({ id: st.id, label: st.id, health: st.failed ? "warn" : "ok", count: st.count, countLabel: "today", systems: [], note: st.note ?? undefined });
+    }
+    const known = stages.filter((s) => s.health !== "unknown").map((s) => s.health);
+    return { id: p.id, name: p.name, health: known.length ? worst(known) : "unknown", stages };
+  });
 }
